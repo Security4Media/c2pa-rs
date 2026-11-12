@@ -720,6 +720,66 @@ pub struct Verify {
     /// This limit is enforced after the HTTP resolver returns. It does not bound
     /// buffering inside a resolver, including the built-in reqwest adapters.
     pub max_manifest_response_size: u64,
+    /// Whether the [`Reader`] retrieves the resources listed in the active manifest's
+    /// [linked resource integrity assertions] and checks them against their declared size,
+    /// media type and hash.
+    ///
+    /// The default value is false: every listed resource is then reported as
+    /// `assertion.linkedResourceIntegrity.skipped`. When true, each resource is reported as
+    /// `match`, `inaccessible`, `sizeMismatch`, `formatMismatch` or `hashMismatch` instead.
+    /// None of these outcomes changes the validation state.
+    ///
+    /// Retrieval follows the spec's rules for external data:
+    /// - It happens only once the active manifest validated, hard binding included. The
+    ///   resources of a manifest that the [`Reader`] reports as `Invalid` stay `skipped`, as do
+    ///   those of ingredient manifests.
+    /// - The signing credential must not be reported untrusted. The spec rejects a claim whose
+    ///   credential is untrusted, which is every claim when `verify.verify_trust` is true (the
+    ///   default) and no trust list is configured, so its resources stay `skipped` even though
+    ///   the validation state is `Valid`: the SDK tolerates `signingCredential.untrusted` in
+    ///   the state. Configure a trust list to retrieve them. With `verify.verify_trust` false
+    ///   the credential is not checked, so retrieval goes ahead without that check.
+    /// - Only `https` URLs are retrieved, and a URL with a userinfo part (`user@host`) is
+    ///   refused. Requests go through the [`Context`] HTTP resolver, so
+    ///   [`Core::allowed_network_hosts`] and [`Core::allow_redirects`] apply, and the built-in
+    ///   resolver follows a redirect only to an `https` URL without a userinfo part. In a
+    ///   browser, `fetch` follows redirects itself, so that per-redirect rule does not apply
+    ///   there. A custom resolver must apply its own policy.
+    /// - The URLs come from the manifest, not from the application. Under the default policy
+    ///   a URL that directly names a loopback or private host is still retrieved, so set
+    ///   [`Core::allowed_network_hosts`] to limit retrieval to the hosts you expect.
+    /// - Each response must be `200 OK` without content coding: the SDK asks for `identity`
+    ///   and does not decode `gzip` or other codings. A custom resolver that decodes must
+    ///   remove the `Content-Encoding` header.
+    /// - The media type compared with `dc:format` is the `Content-Type` of the response, or
+    ///   `application/octet-stream` without one. Type and subtype are compared without regard
+    ///   to case, and parameters such as `charset` are ignored.
+    /// - Each retrieval may take up to 60 seconds, redirects included, and all the retrievals
+    ///   of one manifest together up to 5 minutes. The built-in `ureq` and native `reqwest`
+    ///   resolvers apply the limit to each retrieval; on WASI and in a browser, a single
+    ///   retrieval is bounded only by the platform. At most 100 resources are retrieved per
+    ///   manifest. Resources not attempted within these limits stay `skipped`.
+    /// - The SDK reads at most the declared `size` of a resource, or 256 MiB when it has
+    ///   none. Like [`max_manifest_response_size`](Self::max_manifest_response_size), this
+    ///   limit applies after the HTTP resolver returns. It does not bound buffering inside a
+    ///   resolver, and the built-in `reqwest` adapters read the whole body before returning.
+    ///
+    /// Relative resources resolve against the base set with
+    /// [`Reader::with_linked_resource_base`]; without one they are `inaccessible`. The SDK
+    /// does not derive a base from the asset, not even when reading a file.
+    ///
+    /// <div class="warning">
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    ///
+    /// </div>
+    ///
+    /// [`Reader`]: crate::Reader
+    /// [`Reader::with_linked_resource_base`]: crate::Reader::with_linked_resource_base
+    /// [`Context`]: crate::Context
+    /// [linked resource integrity assertions]: crate::assertions::LinkedResourceIntegrity
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub fetch_linked_resources: bool,
     /// Whether to skip ingredient conflict resolution when multiple ingredients have the same
     /// manifest identifier. This settings is only applicable for C2PA v2 validation.
     ///
@@ -746,6 +806,8 @@ impl Default for Verify {
             ocsp_fetch_should_override: false,
             remote_manifest_fetch: true,
             max_manifest_response_size: DEFAULT_MAX_MANIFEST_RESPONSE_SIZE,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            fetch_linked_resources: false,
             skip_ingredient_conflict_resolution: false,
             strict_v1_validation: false,
         }
@@ -1533,6 +1595,34 @@ pub mod tests {
                     .verify
                     .max_manifest_response_size,
                 20971520
+            );
+        }
+    }
+
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    #[test]
+    fn test_fetch_linked_resources_configuration() {
+        assert!(!Settings::default().verify.fetch_linked_resources);
+
+        for context in [
+            crate::Context::new()
+                .with_settings(r#"{"verify":{"fetch_linked_resources":true}}"#)
+                .unwrap(),
+            crate::Context::new()
+                .with_settings("[verify]\nfetch_linked_resources = true")
+                .unwrap(),
+            crate::Context::new()
+                .with_settings_value("verify.fetch_linked_resources", true)
+                .unwrap(),
+        ] {
+            assert!(context.settings().verify.fetch_linked_resources);
+            let json = serde_json::to_string(context.settings()).unwrap();
+            assert!(
+                Settings::new()
+                    .with_json(&json)
+                    .unwrap()
+                    .verify
+                    .fetch_linked_resources
             );
         }
     }

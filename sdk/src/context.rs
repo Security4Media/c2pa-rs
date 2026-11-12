@@ -70,6 +70,13 @@ pub enum ProgressPhase {
     FetchingOCSP,
     /// Fetching a timestamp from a remote TSA over the network.
     FetchingTimestamp,
+    /// Retrieving a resource listed in a linked resource integrity assertion, over the
+    /// network or from a local base directory. Fires once per resource (`step` = resource
+    /// index, `total` = number of resources to retrieve).
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    FetchingLinkedResource,
 }
 
 /// Progress callback function type.

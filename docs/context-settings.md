@@ -117,6 +117,78 @@ End-to-end protection requires the binding or HTTP adapter to enforce a limit
 while receiving the response, before buffering or copying it.
 Increasing it allows correspondingly larger Store allocations.
 
+### Retrieving linked resources (experimental)
+
+With the experimental `unstable_linked_resource_integrity` feature enabled,
+`verify.fetch_linked_resources` controls whether the `Reader` retrieves the resources
+listed in `c2pa.linked-resource-integrity` assertions. The default is `false`: each resource
+is then reported as `assertion.linkedResourceIntegrity.skipped`.
+
+When it is `true`, the `Reader` retrieves the resources of the active manifest once that
+manifest has validated, hard binding included. Each resource is reported as `match`,
+`inaccessible`, `sizeMismatch`, `formatMismatch` or `hashMismatch`, and none of these changes
+the validation state. The resources of a manifest reported as `Invalid`, and of ingredient
+manifests, stay `skipped`.
+
+Retrieval also needs a signing credential that is not reported untrusted. The spec rejects a
+claim whose credential is untrusted, which is every claim when `verify.verify_trust` is `true`
+(the default) and no trust list is configured, so its resources stay `skipped` even though the
+validation state is `Valid` (the SDK tolerates `signingCredential.untrusted` in the state).
+Configure a trust list to retrieve them. With `verify.verify_trust` set to `false` the
+credential is not checked, so retrieval goes ahead without that check.
+
+Only `https` URLs are retrieved, and a URL with a userinfo part is refused. Requests go
+through the `Context` HTTP resolver, so `core.allowed_network_hosts` and `core.allow_redirects`
+apply, and the built-in resolver follows a redirect only to an `https` URL without a userinfo
+part. In a browser, `fetch` follows redirects itself, so that per-redirect rule does not apply
+there. A custom resolver must apply its own policy. The URLs come from the manifest, and under
+the default policy a URL that directly names a loopback or private host is still retrieved, so
+consider setting `core.allowed_network_hosts` to the hosts you expect.
+
+The media type compared with `dc:format` is the `Content-Type` of the response, or
+`application/octet-stream` without one. Type and subtype are compared without regard to case,
+and parameters such as `charset` are ignored.
+
+Each retrieval may take up to 60 seconds, redirects included, and all the retrievals of one
+manifest together up to 5 minutes. The built-in `ureq` and native `reqwest` resolvers apply the
+limit to each retrieval; on WASI and in a browser, a single retrieval is bounded only by the
+platform. At most 100 resources are retrieved per manifest, and resources not attempted within
+these limits stay `skipped`. The SDK reads at most the declared `size` of a resource, or
+256 MiB when it has none. Like `verify.max_manifest_response_size`, this limit applies after
+the HTTP resolver returns: it does not bound buffering inside a resolver, and the built-in
+reqwest adapters read the whole body before returning.
+
+Relative resources resolve against a base location given on the `Reader`: a local directory
+(with the `file_io` feature) or the `https` URL of the asset. Without one, they are reported
+as `inaccessible`. The SDK does not derive a base from the asset, not even with `with_file`,
+so pass the directory of the file when its resources sit next to it. In a directory, each
+`/`-delimited segment of a URI is percent-decoded on its own, so an encoded `/` is refused, and
+`dc:format` is not compared because a file has no media type.
+
+```rust
+use c2pa::{Context, LinkedResourceBase, Reader, Result};
+
+fn main() -> Result<()> {
+    // Configure a trust list as well, or every resource stays `skipped`.
+    let context = Context::new().with_settings_value("verify.fetch_linked_resources", true)?;
+    let reader = Reader::from_context(context)
+        .with_linked_resource_base(LinkedResourceBase::Directory("assets".into()))
+        .with_file("assets/asset.jpg")?;
+    println!("{:?}", reader.validation_results());
+    Ok(())
+}
+```
+
+Equivalent JSON configuration:
+
+```json
+{
+  "verify": {
+    "fetch_linked_resources": true
+  }
+}
+```
+
 ### Configuring time-stamp requests
 
 A blocking time-stamp request is retried after a transient failure (no answer, a timeout,

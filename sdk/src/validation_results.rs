@@ -170,6 +170,30 @@ fn is_tolerated_manifest_failure_code(code: &str) -> bool {
         || code.starts_with(CAWG_IDENTITY_STATUS_PREFIX)
 }
 
+/// The `resourceUrl` statuses that `ingredient` recorded for its own manifest, with their
+/// kind restored. Its ingredient deltas are about other manifests, so they are left out.
+#[cfg(feature = "unstable_linked_resource_integrity")]
+fn own_resource_statuses(ingredient: &Ingredient) -> Vec<ValidationStatus> {
+    let own: Vec<&ValidationStatus> = match &ingredient.validation_results {
+        Some(results) => results
+            .active_manifest()
+            .map(|codes| {
+                codes
+                    .success()
+                    .iter()
+                    .chain(codes.informational())
+                    .chain(codes.failure())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => ingredient.validation_status.iter().flatten().collect(),
+    };
+    own.into_iter()
+        .filter(|status| status.resource_url().is_some())
+        .map(|status| status.clone().set_kind(log_kind(status.code())))
+        .collect()
+}
+
 /// Labels of the active claim and every manifest transitively referenced by its
 /// ingredient assertions. Claims outside this set are in the store but not part of
 /// the verified provenance, so their ingredient assertions must not take part in
@@ -315,14 +339,31 @@ impl ValidationResults {
                 // reported it for its own label (self-attested), so it can't vouch for another.
                 let mut attested_inside_validity: HashSet<String> = HashSet::new();
 
-                for (own_label, group_statuses) in store
+                // A `resourceUrl` status names no manifest, so it is matched only against the
+                // statuses an ingredient recorded for its own manifest, keyed by that label.
+                #[cfg(feature = "unstable_linked_resource_integrity")]
+                let mut attested_resource_statuses = Vec::<(String, ValidationStatus)>::new();
+
+                for ingredient in store
                     .claims()
                     .iter()
                     .filter(|c| referenced.contains(c.label()))
                     .flat_map(|c| c.ingredient_assertions())
                     .filter_map(|a| Ingredient::from_assertion(a.assertion()).ok())
-                    .filter_map(get_statuses)
                 {
+                    #[cfg(feature = "unstable_linked_resource_integrity")]
+                    let own_resource_statuses = own_resource_statuses(&ingredient);
+                    let Some((own_label, group_statuses)) = get_statuses(ingredient) else {
+                        continue;
+                    };
+                    #[cfg(feature = "unstable_linked_resource_integrity")]
+                    if let Some(own_label) = &own_label {
+                        attested_resource_statuses.extend(
+                            own_resource_statuses
+                                .into_iter()
+                                .map(|status| (own_label.clone(), status)),
+                        );
+                    }
                     if let Some(own_label) = &own_label {
                         if group_statuses.iter().any(|status| {
                             status.code() == validation_status::CLAIM_SIGNATURE_INSIDE_VALIDITY
@@ -343,6 +384,15 @@ impl ValidationResults {
                 // url inside the active manifest) are always kept so an ingredient assertion
                 // can't cancel a genuine active-manifest failure.
                 statuses.retain(|s| {
+                    #[cfg(feature = "unstable_linked_resource_integrity")]
+                    if s.resource_url().is_some() {
+                        return s.ingredient_uri().is_none()
+                            || s.resource_manifest() == active_manifest.as_deref()
+                            || !attested_resource_statuses.iter().any(|(label, attested)| {
+                                s.resource_manifest() == Some(label.as_str()) && attested == s
+                            });
+                    }
+
                     let attested_historical_expiry = s.code()
                         == validation_status::SIGNING_CREDENTIAL_EXPIRED
                         && s.ingredient_uri().is_some()
@@ -550,6 +600,10 @@ impl ValidationResults {
         }
         if let Some(url) = status.url() {
             line.push_str(&format!(" ({url})"));
+        }
+        #[cfg(feature = "unstable_linked_resource_integrity")]
+        if let Some(resource_url) = status.resource_url() {
+            line.push_str(&format!(" ({resource_url})"));
         }
         line
     }
@@ -825,6 +879,16 @@ pub mod validation_codes {
     /// Any corresponding URL should point to a C2PA assertion.
     pub const INGREDIENT_CLAIM_SIGNATURE_VALIDATED: &str = "ingredient.claimSignature.validated";
 
+    /// A resource listed in a linked resource integrity assertion was retrieved and
+    /// every applicable check (size, media type, and hash) succeeded.
+    ///
+    /// The status carries a `resourceUrl` naming the entry instead of a URL.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_MATCH: &str =
+        "assertion.linkedResourceIntegrity.match";
+
     // -- informational codes --
 
     /// The validator chose not to perform an online OCSP check.
@@ -880,6 +944,56 @@ pub mod validation_codes {
     ///
     /// Any corresponding URL should point to a C2PA claim signature box.
     pub const TIME_OF_SIGNING_INSIDE_VALIDITY: &str = "timeOfSigning.insideValidity";
+
+    /// A resource listed in a linked resource integrity assertion was not checked
+    /// because the validator did not retrieve it.
+    ///
+    /// The status carries a `resourceUrl` naming the entry instead of a URL.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED: &str =
+        "assertion.linkedResourceIntegrity.skipped";
+
+    /// A resource listed in a linked resource integrity assertion could not be
+    /// resolved or retrieved.
+    ///
+    /// The status carries a `resourceUrl` naming the entry instead of a URL.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_INACCESSIBLE: &str =
+        "assertion.linkedResourceIntegrity.inaccessible";
+
+    /// The size of a retrieved linked resource does not match the `size` declared
+    /// in the linked resource integrity assertion.
+    ///
+    /// The status carries a `resourceUrl` naming the entry instead of a URL.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_SIZE_MISMATCH: &str =
+        "assertion.linkedResourceIntegrity.sizeMismatch";
+
+    /// The media type of a retrieved linked resource does not match the `dc:format`
+    /// declared in the linked resource integrity assertion.
+    ///
+    /// The status carries a `resourceUrl` naming the entry instead of a URL.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_FORMAT_MISMATCH: &str =
+        "assertion.linkedResourceIntegrity.formatMismatch";
+
+    /// The hash of a retrieved linked resource does not match the hash declared in
+    /// the linked resource integrity assertion.
+    ///
+    /// The status carries a `resourceUrl` naming the entry instead of a URL.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_HASH_MISMATCH: &str =
+        "assertion.linkedResourceIntegrity.hashMismatch";
 
     // -- failure codes --
 
@@ -1280,6 +1394,37 @@ pub mod validation_codes {
     pub const ASSERTION_EXTERNAL_REFERENCE_MALFORMED: &str =
         "assertion.external-reference.malformed";
 
+    /// A linked resource integrity assertion is missing required fields, has the
+    /// wrong shape, or lists no resources.
+    ///
+    /// Any corresponding URL should point to a C2PA assertion. When the problem is
+    /// in one entry, the status carries a `resourceUrl` naming that entry instead.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_MALFORMED: &str =
+        "assertion.linkedResourceIntegrity.malformed";
+
+    /// A linked resource integrity assertion is in `gathered_assertions` rather
+    /// than `created_assertions`.
+    ///
+    /// Any corresponding URL should point to a C2PA assertion.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_NOT_CREATED: &str =
+        "assertion.linkedResourceIntegrity.notCreated";
+
+    /// After percent-decoding, a `relativeResources` URI of a linked resource
+    /// integrity assertion has a path segment that is exactly `..`.
+    ///
+    /// The status carries a `resourceUrl` naming the entry instead of a URL.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub const ASSERTION_LINKED_RESOURCE_INTEGRITY_INVALID_URI: &str =
+        "assertion.linkedResourceIntegrity.invalidURI";
+
     /// The value of an `alg` header, or other header that specifies an
     /// algorithm used to compute the value of another field, is unknown
     /// or unsupported.
@@ -1481,6 +1626,14 @@ pub mod validation_codes {
             | INGREDIENT_CLAIM_SIGNATURE_VALIDATED
             | CAWG_X509_CREDENTIAL_TRUSTED
             | CAWG_X509_SIGNATURE_VALIDATED => LogKind::Success,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            ASSERTION_LINKED_RESOURCE_INTEGRITY_MATCH => LogKind::Success,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED
+            | ASSERTION_LINKED_RESOURCE_INTEGRITY_INACCESSIBLE
+            | ASSERTION_LINKED_RESOURCE_INTEGRITY_SIZE_MISMATCH
+            | ASSERTION_LINKED_RESOURCE_INTEGRITY_FORMAT_MISMATCH
+            | ASSERTION_LINKED_RESOURCE_INTEGRITY_HASH_MISMATCH => LogKind::Informational,
             SIGNING_CREDENTIAL_OCSP_SKIPPED
             | SIGNING_CREDENTIAL_OCSP_INACCESSIBLE
             | SIGNING_CREDENTIAL_OCSP_UNKNOWN
@@ -1970,6 +2123,83 @@ pub mod tests {
 
         // check that there are no failures since they were attested to
         assert!(delta_failures.is_empty());
+    }
+
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    #[test]
+    fn from_store_resource_status_is_cancelled_only_by_its_own_manifest() {
+        use crate::validation_status::ASSERTION_LINKED_RESOURCE_INTEGRITY_MALFORMED as MALFORMED;
+
+        const RESOURCE_URL: &str = "https://example.com/assets/main.js";
+        let lri_uri =
+            |manifest: &str| labels::to_assertion_uri(manifest, "c2pa.linked-resource-integrity");
+
+        // An ingredient assertion for `manifest` that recorded `statuses` for it.
+        let ingredient = |manifest: &str, statuses: Vec<ValidationStatus>| {
+            let mut recorded = ValidationResults::default();
+            for status in statuses {
+                recorded.add_status(status);
+            }
+            Ingredient {
+                relationship: Relationship::ComponentOf,
+                version: 3,
+                active_manifest: Some(HashedUri::new(
+                    labels::to_manifest_uri(manifest),
+                    Some("sha256".into()),
+                    &[0u8; 32],
+                )),
+                validation_results: Some(recorded),
+                ..Default::default()
+            }
+        };
+        let malformed = ValidationStatus::new_failure(MALFORMED).set_resource_url(RESOURCE_URL);
+
+        // `urn:uuid:b` always recorded the failure that validation then finds in `urn:uuid:a`.
+        // The failure must stay unless `urn:uuid:a` recorded it as well.
+        for (a_recorded, kept) in [(Vec::new(), true), (vec![malformed.clone()], false)] {
+            let mut outer_claim = Claim::new("test-generator", None, 2);
+            outer_claim
+                .add_assertion(&ingredient("urn:uuid:a", a_recorded))
+                .unwrap();
+            outer_claim
+                .add_assertion(&ingredient("urn:uuid:b", vec![malformed.clone()]))
+                .unwrap();
+            let outer_label = outer_claim.label().to_string();
+            let a_ingredient_uri = labels::to_assertion_uri(
+                &outer_label,
+                &outer_claim.ingredient_assertions()[0].label(),
+            );
+            let mut store = Store::new();
+            store.insert_restored_claim(outer_label, outer_claim);
+
+            // Validation finds the failure in `urn:uuid:a`.
+            let mut tracker = StatusTracker::default();
+            tracker.push_ingredient_uri(a_ingredient_uri);
+            log_item!(lri_uri("urn:uuid:a"), "entry is malformed", "test")
+                .set_resource_url(RESOURCE_URL)
+                .validation_status(MALFORMED)
+                .failure_no_throw(
+                    &mut tracker,
+                    crate::Error::ValidationRule("malformed".into()),
+                );
+            tracker.pop_ingredient_uri();
+
+            let results = ValidationResults::from_store(&store, &tracker);
+
+            let delta_failures: Vec<_> = results
+                .ingredient_deltas()
+                .into_iter()
+                .flatten()
+                .flat_map(|delta| delta.validation_deltas().failure())
+                .map(|status| (status.code(), status.resource_url()))
+                .collect();
+            let expected = if kept {
+                vec![(MALFORMED, Some(RESOURCE_URL))]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(delta_failures, expected, "kept: {kept}");
+        }
     }
 
     #[test]

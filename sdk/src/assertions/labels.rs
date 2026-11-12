@@ -67,6 +67,14 @@ pub const CLOUD_DATA: &str = "c2pa.cloud-data";
 /// See [External reference - C2PA Technical Specification](https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#_external_reference).
 pub const EXTERNAL_REFERENCE: &str = "c2pa.external-reference";
 
+/// Label for a linked resource integrity assertion.
+///
+/// See [Linked resource integrity - C2PA Technical Specification](https://spec.c2pa.org/specifications/specifications/2.5/specs/C2PA_Specification.html#linked_resource_integrity_assertion).
+///
+/// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub const LINKED_RESOURCE_INTEGRITY: &str = "c2pa.linked-resource-integrity";
+
 /// Label prefix for a thumbnail assertion.
 ///
 /// See [Thumbnail - C2PA Technical Specification](https://spec.c2pa.org/specifications/specifications/2.3/specs/C2PA_Specification.html#_thumbnail).

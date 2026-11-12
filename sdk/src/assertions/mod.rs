@@ -103,3 +103,12 @@ pub use cloud_data::{CloudData, HashedExtUri};
 
 mod external_reference;
 pub use external_reference::{ExternalReference, ExternalReferenceLocation, UnhashedExtUri};
+
+#[cfg(feature = "unstable_linked_resource_integrity")]
+mod linked_resource_integrity;
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub(crate) use linked_resource_integrity::{
+    hash_resource, LinkedResourceEntry, LinkedResourceFinding,
+};
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub use linked_resource_integrity::{ExternalResource, LinkedResourceIntegrity, LinkedResources};
