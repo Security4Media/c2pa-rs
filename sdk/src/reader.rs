@@ -30,6 +30,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 
+#[cfg(feature = "unstable_linked_resource_integrity")]
+use crate::linked_resource_retrieval::{
+    retrieve_linked_resources, retrieve_linked_resources_async, LinkedResourceBase,
+};
 #[cfg(feature = "file_io")]
 use crate::utils::io_utils::uri_to_path;
 use crate::{
@@ -116,6 +120,11 @@ pub struct Reader {
 
     #[serde(skip)]
     context: Arc<Context>,
+
+    #[serde(skip)]
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    /// Location that relative linked resources resolve against
+    linked_resource_base: Option<LinkedResourceBase>,
 }
 
 impl Default for Reader {
@@ -129,6 +138,8 @@ impl Default for Reader {
             store: Arc::new(Store::new()),
             assertion_values: HashMap::new(),
             context: Arc::new(Context::default()),
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            linked_resource_base: None,
         }
     }
 }
@@ -204,6 +215,48 @@ impl Reader {
             assertion_values: HashMap::new(),
             ..Default::default()
         }
+    }
+
+    /// Sets the location that the `relativeResources` of linked resource integrity
+    /// assertions resolve against. Call it before reading.
+    ///
+    /// The base matters only when the `verify.fetch_linked_resources` setting is on. Without
+    /// a base, relative resources are reported as
+    /// `assertion.linkedResourceIntegrity.inaccessible`. The SDK does not derive a base from
+    /// the asset, not even with [`with_file`](Self::with_file): resolving the URIs reads
+    /// files or URLs that the manifest names, so the application chooses where. To resolve
+    /// them next to a file, pass its directory as `LinkedResourceBase::Directory`. See
+    /// [`LinkedResourceBase`] for how each kind of base resolves.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use c2pa::{Context, LinkedResourceBase, Reader, Result};
+    /// # fn main() -> Result<()> {
+    /// let context =
+    ///     Context::new().with_settings(r#"{"verify": {"fetch_linked_resources": true}}"#)?;
+    /// let reader = Reader::from_context(context).with_linked_resource_base(LinkedResourceBase::Url(
+    ///     "https://example.com/scenes/scene.mtlx".to_owned(),
+    /// ));
+    /// // Then read as usual, for example with `reader.with_stream(format, stream)`.
+    /// # let _ = reader;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// <div class="warning">
+    ///
+    /// **Experimental.** This method is available only with the
+    /// `unstable_linked_resource_integrity` feature enabled. It is exempt from this crate's
+    /// usual semantic-versioning stability guarantees and may change in a
+    /// backward-incompatible way, or be removed entirely, in any release.
+    ///
+    /// </div>
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    #[must_use]
+    pub fn with_linked_resource_base(mut self, base: LinkedResourceBase) -> Self {
+        self.linked_resource_base = Some(base);
+        self
     }
 
     /// Add manifest store from a stream to the [`Reader`].
@@ -889,6 +942,7 @@ impl Reader {
         validation_log: &mut StatusTracker,
     ) -> Result<&Self> {
         let active_manifest = store.provenance_label();
+
         let arc_store = Arc::new(store);
         let mut manifests = HashMap::new();
         let mut options = StoreOptions::default();
@@ -935,6 +989,24 @@ impl Reader {
                         .failure(validation_log, Error::C2PAValidation(e.to_string()))?;
                 }
             };
+        }
+
+        // The spec allows retrieving linked resources only for a claim that validated, so this
+        // waits for the manifests to load: a manifest that fails to load is logged above.
+        #[cfg(feature = "unstable_linked_resource_integrity")]
+        {
+            let base = self.linked_resource_base.as_ref();
+            if _sync {
+                retrieve_linked_resources(arc_store.as_ref(), validation_log, &self.context, base)?;
+            } else {
+                retrieve_linked_resources_async(
+                    arc_store.as_ref(),
+                    validation_log,
+                    &self.context,
+                    base,
+                )
+                .await?;
+            }
         }
 
         let validation_results = ValidationResults::from_store(arc_store.as_ref(), validation_log);

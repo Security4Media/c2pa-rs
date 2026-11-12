@@ -16,6 +16,8 @@ use std::path::Path;
 
 use async_generic::async_generic;
 
+#[cfg(feature = "unstable_linked_resource_integrity")]
+use crate::claim::ClaimAssertionType;
 use crate::{
     assertion::{Assertion, AssertionBase, AssertionData},
     assertions::{
@@ -1922,15 +1924,7 @@ impl Claim {
             }
 
             // we can skip if this is a redacted assertion
-            if svi.redactions.iter().any(|r| {
-                let r_manifest = manifest_label_from_uri(r).unwrap_or_default();
-                if r_manifest == claim.label() {
-                    let (r_label, r_instance) = Claim::assertion_label_from_link(r);
-                    r_label == label && r_instance == instance
-                } else {
-                    false
-                }
-            }) {
+            if Claim::is_redacted_assertion(claim, svi, &label, instance) {
                 continue;
             }
 
@@ -2030,7 +2024,28 @@ impl Claim {
         // external-reference assertion validation applies to all claim versions
         Claim::verify_external_reference(claim, validation_log)?;
 
+        #[cfg(feature = "unstable_linked_resource_integrity")]
+        Claim::verify_linked_resource_integrity(claim, svi, validation_log)?;
+
         Ok(())
+    }
+
+    /// Whether `svi` lists the assertion of `claim` with this label and instance as redacted.
+    fn is_redacted_assertion(
+        claim: &Claim,
+        svi: &StoreValidationInfo,
+        label: &str,
+        instance: usize,
+    ) -> bool {
+        svi.redactions.iter().any(|r| {
+            let r_manifest = manifest_label_from_uri(r).unwrap_or_default();
+            if r_manifest == claim.label() {
+                let (r_label, r_instance) = Claim::assertion_label_from_link(r);
+                r_label == label && r_instance == instance
+            } else {
+                false
+            }
+        })
     }
 
     // Validate claim_generator_info for v2+ claims per §10.2.2.
@@ -2272,6 +2287,105 @@ impl Claim {
         }
 
         Ok(())
+    }
+
+    /// Validate each `c2pa.linked-resource-integrity` assertion per C2PA 2.5.
+    ///
+    /// Applies the structural steps of the procedure: placement in `created_assertions`, the
+    /// shape of `resources` and its entries, the hash algorithms, and `relativeResources`
+    /// URIs. Then reports exactly one terminal code for each well-formed entry. Statuses about
+    /// one entry carry its `url` or `uri` as `resourceUrl`.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub(super) fn verify_linked_resource_integrity(
+        claim: &Claim,
+        svi: &StoreValidationInfo,
+        validation_log: &mut StatusTracker,
+    ) -> Result<()> {
+        use assertions::LinkedResourceIntegrity;
+
+        for ca in claim.linked_resource_integrity_assertions() {
+            let label = to_assertion_uri(claim.label(), &ca.label());
+
+            // Placement depends only on the claim, so it is checked even for a redacted
+            // assertion, which the spec counts as valid before type-specific validation.
+            if ca.assertion_type() != ClaimAssertionType::Created {
+                log_item!(
+                    label.clone(),
+                    "linked resource integrity assertion is not in created_assertions",
+                    "verify_linked_resource_integrity"
+                )
+                .validation_status(
+                    validation_status::ASSERTION_LINKED_RESOURCE_INTEGRITY_NOT_CREATED,
+                )
+                .failure(
+                    validation_log,
+                    Error::ValidationRule(format!("{label} is not a created assertion")),
+                )?;
+            }
+
+            // A redacted assertion has no content left to check.
+            if Claim::is_redacted_assertion(claim, svi, &ca.label_raw(), ca.instance()) {
+                continue;
+            }
+
+            let check = LinkedResourceIntegrity::check(ca.assertion());
+            for finding in &check.findings {
+                Claim::log_linked_resource_finding(&label, finding, validation_log)?;
+            }
+            Claim::report_linked_resources(&label, &check.entries, validation_log);
+        }
+
+        Ok(())
+    }
+
+    /// Logs one finding of the structural check against the assertion at `label`.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub(super) fn log_linked_resource_finding(
+        label: &str,
+        finding: &assertions::LinkedResourceFinding,
+        validation_log: &mut StatusTracker,
+    ) -> Result<()> {
+        let explanation = finding.explanation();
+        let mut item = log_item!(
+            label.to_owned(),
+            explanation.clone(),
+            "verify_linked_resource_integrity"
+        )
+        .validation_status(finding.code());
+        if let Some(resource_url) = finding.resource_url() {
+            item = item.set_resource_url(resource_url.to_owned());
+        }
+
+        if finding.is_failure() {
+            item.failure(validation_log, Error::ValidationRule(explanation))?;
+        } else {
+            item.informational(validation_log);
+        }
+        Ok(())
+    }
+
+    /// Reports the terminal code of each well-formed entry, which never rejects the claim.
+    ///
+    /// Claim verification never retrieves linked resources, so every entry is reported as
+    /// `assertion.linkedResourceIntegrity.skipped`. When retrieval is enabled, the
+    /// [`Reader`](crate::Reader) later replaces these statuses for the active manifest with
+    /// the retrieval outcomes; see `linked_resource_retrieval`.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    fn report_linked_resources(
+        label: &str,
+        entries: &[assertions::LinkedResourceEntry],
+        validation_log: &mut StatusTracker,
+    ) {
+        for entry in entries {
+            log_item!(
+                label.to_owned(),
+                "linked resource was not retrieved",
+                "verify_linked_resource_integrity"
+            )
+            .set_resource_url(entry.resource_url().to_owned())
+            .validation_status(validation_status::ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED)
+            .informational(validation_log);
+        }
     }
 
     // Perform metadata validation check.

@@ -28,6 +28,8 @@ use serde_with::skip_serializing_none;
 use uuid::Uuid;
 use zip::ZipArchive;
 
+#[cfg(feature = "unstable_linked_resource_integrity")]
+use crate::assertions::LinkedResourceIntegrity;
 #[allow(deprecated)]
 use crate::assertions::{CreativeWork, Exif};
 // Only the experimental filtering API resolves ingredient references by positional assertion
@@ -1750,6 +1752,21 @@ impl Builder {
                     // user metadata will go through the fallback path
                     let metadata: Metadata = manifest_assertion.to_assertion()?;
                     add_assertion(&mut claim, &metadata, manifest_assertion.created())?;
+                }
+                #[cfg(feature = "unstable_linked_resource_integrity")]
+                LinkedResourceIntegrity::LABEL => {
+                    // A v1 claim has no created_assertions, the only place the spec allows
+                    // this assertion, so validation would always reject it there.
+                    if claim.version() < 2 {
+                        return Err(Error::VersionCompatibility(format!(
+                            "{} requires a v2 claim",
+                            LinkedResourceIntegrity::LABEL
+                        )));
+                    }
+                    // The definition's `created` flag and `created_assertion_labels` do not
+                    // apply, for the same reason.
+                    let lri: LinkedResourceIntegrity = manifest_assertion.to_assertion()?;
+                    claim.add_created_assertion(&lri)?;
                 }
                 _ => match &manifest_assertion.data {
                     AssertionData::Json(value) => {
@@ -13325,5 +13342,198 @@ mod tests {
         assert!(has(results.failure(), SIGNING_CREDENTIAL_REVOKED));
         assert!(!has(results.success(), SIGNING_CREDENTIAL_TRUSTED));
         assert!(!has(results.success(), CLAIM_SIGNATURE_VALIDATED));
+    }
+}
+
+#[cfg(all(test, feature = "unstable_linked_resource_integrity"))]
+mod linked_resource_integrity_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::assert_matches;
+
+    use c2pa_cbor::Value;
+    use serde_json::json;
+
+    use super::*;
+    use crate::{assertions::ExternalResource, utils::test::test_context};
+
+    const MAIN_JS_HASH: &str = "Hf0IgeqbL0m+FTTLpUWwsDGR8pvhUR1AlwvaXjQ0qGY=";
+    const ALBEDO_PNG_HASH: &str = "kQ7J3p+xYL8mHkR4Y0vKDg2aWHC5cGxDJSFj5oozmQI=";
+
+    fn is_lri_uri(uri: &HashedUri) -> bool {
+        uri.url().ends_with(LinkedResourceIntegrity::LABEL)
+    }
+
+    /// The decoded CBOR of the claim's linked resource integrity assertion.
+    fn lri_value(claim: &Claim) -> Value {
+        let assertion = claim
+            .get_assertion(LinkedResourceIntegrity::LABEL, 0)
+            .unwrap();
+        c2pa_cbor::from_slice(assertion.data()).unwrap()
+    }
+
+    /// The `hash` of every entry of `list` in `value`.
+    fn entry_hashes<'a>(value: &'a Value, list: &str) -> Vec<&'a Value> {
+        let field = |value: &'a Value, key: &str| -> &'a Value {
+            let Value::Map(map) = value else {
+                return &Value::Null;
+            };
+            map.get(&Value::Text(key.to_owned()))
+                .unwrap_or(&Value::Null)
+        };
+        let Value::Array(entries) = field(field(value, "resources"), list) else {
+            return Vec::new();
+        };
+        entries.iter().map(|entry| field(entry, "hash")).collect()
+    }
+
+    #[test]
+    fn assertion_is_created_whatever_the_settings_say() {
+        let mut context = test_context();
+        context.settings_mut().builder.created_assertion_labels =
+            Some(vec![labels::METADATA.to_owned()]);
+        let lri = LinkedResourceIntegrity::external(vec![ExternalResource::from_bytes(
+            "https://example.com/app.js",
+            "sha256",
+            b"console.log(1);",
+        )
+        .unwrap()]);
+        let mut builder = Builder::from_context(context);
+        builder
+            .add_assertion(LinkedResourceIntegrity::LABEL, &lri)
+            .unwrap();
+
+        let claim = builder.to_claim().unwrap();
+
+        assert!(claim.created_assertions().iter().any(is_lri_uri));
+        assert!(!claim
+            .gathered_assertions()
+            .is_some_and(|gathered| gathered.iter().any(is_lri_uri)));
+    }
+
+    #[test]
+    fn json_definition_stores_hashes_as_byte_strings() {
+        let builder = Builder::from_context(test_context())
+            .with_definition(
+                json!({
+                    "assertions": [{
+                        "label": "c2pa.linked-resource-integrity",
+                        "data": {
+                            "resources": {
+                                "externalResources": [
+                                    {
+                                        "url": "https://example.com/main.js",
+                                        "alg": "sha256",
+                                        "hash": MAIN_JS_HASH,
+                                        "dc:format": "text/javascript"
+                                    },
+                                    {
+                                        "url": "https://example.com/style.css",
+                                        "alg": "sha256",
+                                        "hash": format!("b64'{MAIN_JS_HASH}'")
+                                    }
+                                ]
+                            },
+                            "allURIsIncluded": true
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let claim = builder.to_claim().unwrap();
+
+        let expected = Value::Bytes(crate::crypto::base64::decode(MAIN_JS_HASH).unwrap());
+        assert_eq!(
+            entry_hashes(&lri_value(&claim), "externalResources"),
+            [&expected, &expected]
+        );
+        assert!(claim.created_assertions().iter().any(is_lri_uri));
+    }
+
+    #[test]
+    fn json_definition_with_relative_resources_stores_hash_as_byte_string() {
+        let builder = Builder::from_context(test_context())
+            .with_definition(
+                json!({
+                    "assertions": [{
+                        "label": "c2pa.linked-resource-integrity",
+                        "data": {
+                            "resources": {
+                                "relativeResources": [
+                                    { "uri": "./scenes/albedo.png", "hash": ALBEDO_PNG_HASH }
+                                ],
+                                "alg": "sha256"
+                            }
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        let claim = builder.to_claim().unwrap();
+
+        let expected = Value::Bytes(crate::crypto::base64::decode(ALBEDO_PNG_HASH).unwrap());
+        assert_eq!(
+            entry_hashes(&lri_value(&claim), "relativeResources"),
+            [&expected]
+        );
+    }
+
+    #[test]
+    fn malformed_definition_fails_when_building_the_claim() {
+        let builder = Builder::from_context(test_context())
+            .with_definition(
+                json!({
+                    "assertions": [{
+                        "label": "c2pa.linked-resource-integrity",
+                        "data": { "resources": { "externalResources": [] } }
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        assert_matches!(builder.to_claim(), Err(Error::AssertionDecoding(_)));
+    }
+
+    #[test]
+    fn empty_data_types_fail_when_building_the_claim() {
+        let lri = LinkedResourceIntegrity::external(vec![ExternalResource::from_bytes(
+            "https://example.com/app.js",
+            "sha256",
+            b"console.log(1);",
+        )
+        .unwrap()
+        .set_data_types(Vec::new())]);
+        let mut builder = Builder::from_context(test_context());
+        builder
+            .add_assertion(LinkedResourceIntegrity::LABEL, &lri)
+            .unwrap();
+
+        assert_matches!(builder.to_claim(), Err(Error::AssertionDecoding(_)));
+    }
+
+    #[test]
+    fn v1_claim_refuses_the_assertion() {
+        let lri = LinkedResourceIntegrity::external(vec![ExternalResource::from_bytes(
+            "https://example.com/app.js",
+            "sha256",
+            b"console.log(1);",
+        )
+        .unwrap()]);
+        let mut builder = Builder::from_context(test_context())
+            .with_definition(json!({ "claim_version": 1 }).to_string())
+            .unwrap();
+        builder
+            .add_assertion(LinkedResourceIntegrity::LABEL, &lri)
+            .unwrap();
+
+        assert_matches!(
+            builder.to_claim(),
+            Err(Error::VersionCompatibility(message)) if message.contains("v2 claim")
+        );
     }
 }
