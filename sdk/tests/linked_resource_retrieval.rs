@@ -438,7 +438,7 @@ fn relative_resources_resolve_against_a_url_base() -> Result<()> {
 }
 
 #[c2pa_test_async]
-async fn relative_resources_without_a_base_are_inaccessible_async() -> Result<()> {
+async fn relative_resources_without_a_base_stay_skipped_async() -> Result<()> {
     let asset = sign(&relative("./textures/albedo.png", ALBEDO)?)?;
     let resolver = MockResolver::default();
 
@@ -446,9 +446,86 @@ async fn relative_resources_without_a_base_are_inaccessible_async() -> Result<()
         .with_stream_async(FORMAT, Cursor::new(&asset))
         .await?;
 
+    assert_eq!(lri_statuses(&reader), [(SKIPPED, "./textures/albedo.png")]);
+    let explanation = reader
+        .validation_results()
+        .and_then(|results| results.active_manifest())
+        .and_then(|active| {
+            active
+                .informational()
+                .iter()
+                .find(|status| status.code() == SKIPPED)
+        })
+        .and_then(|status| status.explanation());
+    assert!(
+        explanation.is_some_and(|text| text.contains("no base")),
+        "{explanation:?}"
+    );
+    assert!(resolver.requested_urls().is_empty());
+    Ok(())
+}
+
+#[test]
+fn relative_resources_without_a_base_take_no_retrieval_slot() -> Result<()> {
+    let mut builder = Builder::from_context(test_context());
+    builder.set_intent(BuilderIntent::Edit);
+    builder.add_assertion(
+        LinkedResourceIntegrity::LABEL,
+        &relative("./textures/albedo.png", ALBEDO)?,
+    )?;
+    builder.add_assertion(
+        LinkedResourceIntegrity::LABEL,
+        &LinkedResourceIntegrity::external(vec![script(SCRIPT_URL)?]),
+    )?;
+    let mut dest = Cursor::new(Vec::new());
+    builder.sign(
+        &test_signer(),
+        FORMAT,
+        &mut Cursor::new(include_bytes!("fixtures/no_manifest.jpg")),
+        &mut dest,
+    )?;
+    let resolver = MockResolver::new([(SCRIPT_URL, "text/javascript", SCRIPT)]);
+    let context = mock_context(&resolver).with_settings_value("verify.max_linked_resources", 1)?;
+
+    let reader = read(Reader::from_context(context), dest.get_ref())?;
+
     assert_eq!(
         lri_statuses(&reader),
-        [(INACCESSIBLE, "./textures/albedo.png")]
+        [(MATCH, SCRIPT_URL), (SKIPPED, "./textures/albedo.png")]
+    );
+    assert_eq!(resolver.requested_urls(), [SCRIPT_URL]);
+    Ok(())
+}
+
+#[test]
+fn retrieval_limits_come_from_the_settings() -> Result<()> {
+    const SECOND_URL: &str = "https://example.com/assets/second.js";
+    let asset = sign(&LinkedResourceIntegrity::external(vec![
+        script(SCRIPT_URL)?,
+        script(SECOND_URL)?,
+    ]))?;
+    let resolver = MockResolver::new([
+        (SCRIPT_URL, "text/javascript", SCRIPT),
+        (SECOND_URL, "text/javascript", SCRIPT),
+    ]);
+
+    // Entries past the count limit are not attempted.
+    let context = mock_context(&resolver).with_settings_value("verify.max_linked_resources", 1)?;
+    let reader = read(Reader::from_context(context), &asset)?;
+    assert_eq!(
+        lri_statuses(&reader),
+        [(MATCH, SCRIPT_URL), (SKIPPED, SECOND_URL)]
+    );
+    assert_eq!(resolver.requested_urls(), [SCRIPT_URL]);
+
+    // A declared size above the size limit is refused before any request.
+    let resolver = MockResolver::new([(SCRIPT_URL, "text/javascript", SCRIPT)]);
+    let context = mock_context(&resolver)
+        .with_settings_value("verify.max_linked_resource_size", SCRIPT.len() as u64 - 1)?;
+    let reader = read(Reader::from_context(context), &asset)?;
+    assert_eq!(
+        lri_statuses(&reader),
+        [(INACCESSIBLE, SCRIPT_URL), (INACCESSIBLE, SECOND_URL)]
     );
     assert!(resolver.requested_urls().is_empty());
     Ok(())

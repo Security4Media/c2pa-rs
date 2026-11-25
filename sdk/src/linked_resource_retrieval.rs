@@ -56,27 +56,8 @@ use crate::{
     validation_status, Result,
 };
 
-// The docs of `Verify::fetch_linked_resources` and docs/context-settings.md state the values
-// of the next four limits.
-
-/// Maximum number of resources retrieved per manifest. Entries past it stay `skipped`, so that
-/// one manifest cannot make the validator issue an unbounded number of requests.
-const MAX_RETRIEVALS: usize = 100;
-
-/// Largest resource read, in bytes. A declared `size` above it makes the resource
-/// `inaccessible` without any request. A resource without a declared size is `inaccessible`
-/// once it turns out larger.
-const MAX_RESOURCE_SIZE: u64 = 256 * 1024 * 1024; // 256 MiB
-
-/// Time limit for one network retrieval, redirects and body included. The built-in `ureq` and
-/// native `reqwest` resolvers apply it through [`RequestTimeout`].
-const RETRIEVAL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Time limit for all the retrievals of one manifest. Retrievals run one after another, so
-/// without it a manifest listing [`MAX_RETRIEVALS`] slow resources could hold a read for
-/// [`MAX_RETRIEVALS`] times [`RETRIEVAL_TIMEOUT`]. Entries not attempted in time stay
-/// `skipped`.
-const RETRIEVAL_BUDGET: Duration = Duration::from_secs(5 * 60);
+/// Why a relative resource is left `skipped` when the application set no base.
+const NO_BASE: &str = "no base location is set on the Reader for relative resources";
 
 /// Media type of an HTTP response without `Content-Type` (RFC 9110, section 8.3).
 const DEFAULT_MEDIA_TYPE: &str = "application/octet-stream";
@@ -91,8 +72,9 @@ const BODY_DECODED_BY_PLATFORM: bool = cfg!(all(target_arch = "wasm32", not(targ
 /// location with [`Reader::with_linked_resource_base`](crate::Reader::with_linked_resource_base),
 /// because resolving it reads files or URLs that the manifest names. The SDK never derives a
 /// base from the asset, not even when reading a file, and never falls back to the working
-/// directory: without a base, relative resources are reported as
-/// `assertion.linkedResourceIntegrity.inaccessible` when retrieval is on.
+/// directory: without a base, relative resources are not retrieved and stay
+/// `assertion.linkedResourceIntegrity.skipped`, with an explanation saying that no base is
+/// set.
 ///
 /// With either base, a URI that has a scheme or an authority (`//host`), or that contains a
 /// backslash, a space or a control character, is not resolved.
@@ -140,7 +122,11 @@ pub enum LinkedResourceBase {
 /// Does nothing unless `verify.fetch_linked_resources` is on, and nothing when the active
 /// claim is rejected (see `active_claim_rejected`): the spec forbids retrieving external data
 /// for a rejected claim. Resources of ingredient manifests are never retrieved, since `base`
-/// locates the asset being read, not its ingredients.
+/// locates the asset being read, not its ingredients. Without `base`, relative resources stay
+/// `skipped`, and only their explanation changes.
+///
+/// The other `verify.*_linked_resource*` settings bound the number of retrievals, the size
+/// read and the time spent; resources not attempted within them stay `skipped`.
 ///
 /// # Errors
 ///
@@ -153,7 +139,8 @@ pub(crate) fn retrieve_linked_resources(
     context: &Context,
     base: Option<&LinkedResourceBase>,
 ) -> Result<()> {
-    if !context.settings().verify.fetch_linked_resources {
+    let verify = &context.settings().verify;
+    if !verify.fetch_linked_resources {
         return Ok(());
     }
     let Some(claim) = store.provenance_claim() else {
@@ -165,24 +152,54 @@ pub(crate) fn retrieve_linked_resources(
     }
 
     let base = Base::new(base);
-    let deadline = Deadline::start(RETRIEVAL_BUDGET);
+    // Entries left `skipped` take no retrieval slot, so they cannot crowd out the others.
+    let (not_attempted, mut pending): (Vec<_>, Vec<_>) = pending
+        .into_iter()
+        .partition(|pending| base.leaves_skipped(&pending.entry));
+    for PendingRetrieval { index, entry } in not_attempted {
+        record(
+            validation_log,
+            index,
+            &entry,
+            Outcome::Skipped(NO_BASE.into()),
+        );
+    }
+    pending.truncate(usize::try_from(verify.max_linked_resources).unwrap_or(usize::MAX));
+
+    let deadline = Deadline::start(
+        Duration::from_millis(verify.linked_resource_total_timeout_in_ms),
+        Duration::from_millis(verify.linked_resource_timeout_in_ms),
+    );
     let total = u32::try_from(pending.len()).unwrap_or(u32::MAX);
     for (step, PendingRetrieval { index, entry }) in (1..).zip(pending) {
         context.check_progress(ProgressPhase::FetchingLinkedResource, step, total)?;
         let Some(timeout) = deadline.next_timeout() else {
             break;
         };
-
-        let outcome = if _sync {
-            retrieve(&entry, &base, context, timeout)
-        } else {
-            retrieve_async(&entry, &base, context, timeout).await
+        let allowance = Allowance {
+            timeout,
+            max_size: verify.max_linked_resource_size,
         };
 
-        let skipped = &mut validation_log.logged_items_mut()[index];
-        *skipped = outcome.into_log_item(skipped.label.to_string(), entry.resource_url());
+        let outcome = if _sync {
+            retrieve(&entry, &base, context, allowance)
+        } else {
+            retrieve_async(&entry, &base, context, allowance).await
+        };
+        record(validation_log, index, &entry, outcome);
     }
     Ok(())
+}
+
+/// Replaces the `skipped` status at `index` with the status reporting `outcome` for `entry`.
+fn record(
+    validation_log: &mut StatusTracker,
+    index: usize,
+    entry: &LinkedResourceEntry,
+    outcome: Outcome,
+) {
+    let skipped = &mut validation_log.logged_items_mut()[index];
+    *skipped = outcome.into_log_item(skipped.label.to_string(), entry.resource_url());
 }
 
 /// Whether the active claim of `store` is rejected, judging by `validation_log`.
@@ -212,8 +229,7 @@ struct PendingRetrieval {
     entry: LinkedResourceEntry,
 }
 
-/// Pairs each `skipped` status of the active manifest of `claim` with its entry, up to
-/// [`MAX_RETRIEVALS`].
+/// Pairs each `skipped` status of the active manifest of `claim` with its entry.
 ///
 /// Claim verification logs one `skipped` per well-formed entry, in entry order, so the
 /// statuses of an assertion pair up with the entries of a fresh structural check. An
@@ -250,7 +266,6 @@ fn pending_retrievals(claim: &Claim, validation_log: &StatusTracker) -> Vec<Pend
             );
         }
     }
-    pending.truncate(MAX_RETRIEVALS);
     pending
 }
 
@@ -266,29 +281,42 @@ fn is_skipped_status(item: &LogItem, label: &str) -> bool {
 struct Deadline {
     started: web_time::Instant,
     budget: Duration,
+    per_retrieval: Duration,
 }
 
 impl Deadline {
-    fn start(budget: Duration) -> Self {
+    fn start(budget: Duration, per_retrieval: Duration) -> Self {
         Self {
             started: web_time::Instant::now(),
             budget,
+            per_retrieval,
         }
     }
 
-    /// The time limit for the next retrieval: [`RETRIEVAL_TIMEOUT`], or what is left of the
+    /// The time limit for the next retrieval: the per-retrieval limit, or what is left of the
     /// budget if that is less. `None` once the budget is spent.
     fn next_timeout(&self) -> Option<Duration> {
         self.budget
             .checked_sub(self.started.elapsed())
             .filter(|left| !left.is_zero())
-            .map(|left| left.min(RETRIEVAL_TIMEOUT))
+            .map(|left| left.min(self.per_retrieval))
     }
+}
+
+/// What one retrieval may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Allowance {
+    /// Time limit, redirects and body included.
+    timeout: Duration,
+    /// Most bytes read when the entry declares no `size`; a larger declared `size` is refused.
+    max_size: u64,
 }
 
 /// The terminal outcome of retrieving one entry.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
+    /// The resource was not retrieved; the reason says why.
+    Skipped(String),
     /// Every applicable check passed. `dc_format_skipped` is set when the entry declares a
     /// `dc:format` that could not be compared, because the resource has no media type.
     Match { dc_format_skipped: bool },
@@ -305,6 +333,7 @@ enum Outcome {
 impl Outcome {
     fn code(&self) -> &'static str {
         match self {
+            Self::Skipped(_) => validation_status::ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED,
             Self::Match { .. } => validation_status::ASSERTION_LINKED_RESOURCE_INTEGRITY_MATCH,
             Self::Inaccessible(_) => {
                 validation_status::ASSERTION_LINKED_RESOURCE_INTEGRITY_INACCESSIBLE
@@ -325,7 +354,8 @@ impl Outcome {
     fn kind(&self) -> LogKind {
         match self {
             Self::Match { .. } => LogKind::Success,
-            Self::Inaccessible(_)
+            Self::Skipped(_)
+            | Self::Inaccessible(_)
             | Self::SizeMismatch(_)
             | Self::FormatMismatch(_)
             | Self::HashMismatch => LogKind::Informational,
@@ -334,6 +364,7 @@ impl Outcome {
 
     fn explanation(&self) -> String {
         match self {
+            Self::Skipped(reason) => format!("linked resource was not retrieved: {reason}"),
             Self::Match {
                 dc_format_skipped: false,
             } => "linked resource matches the values declared in the assertion".into(),
@@ -365,7 +396,7 @@ impl Outcome {
 /// The [`LinkedResourceBase`] of a read, checked once for all of its entries.
 #[derive(Debug)]
 enum Base {
-    /// No base was set, so relative resources cannot be resolved.
+    /// No base was set, so relative resources are not retrieved.
     Missing,
     /// A base was set but cannot be used; the reason says why.
     Unusable(String),
@@ -392,28 +423,35 @@ impl Base {
             },
         }
     }
+
+    /// Whether `entry` is left `skipped` rather than retrieved: a relative resource when no
+    /// base is set. Not trying is the spec's `skipped`, while `inaccessible` would suggest
+    /// the resource is missing.
+    fn leaves_skipped(&self, entry: &LinkedResourceEntry) -> bool {
+        matches!(self, Self::Missing) && matches!(entry, LinkedResourceEntry::Relative { .. })
+    }
 }
 
-/// Retrieves the resource of `entry` within `timeout` and compares it with the declared
+/// Retrieves the resource of `entry` within `allowance` and compares it with the declared
 /// values.
 #[async_generic]
 fn retrieve(
     entry: &LinkedResourceEntry,
     base: &Base,
     context: &Context,
-    timeout: Duration,
+    allowance: Allowance,
 ) -> Outcome {
     let retrieved = match locate(entry, base) {
         Ok(Location::Remote(url)) => {
             if _sync {
-                fetch(&url, entry, context, timeout)
+                fetch(&url, entry, context, allowance)
             } else {
-                fetch_async(&url, entry, context, timeout).await
+                fetch_async(&url, entry, context, allowance).await
             }
         }
         #[cfg(feature = "file_io")]
-        Ok(Location::File(path)) => read_file(&path, entry),
-        Err(reason) => Err(Outcome::Inaccessible(reason)),
+        Ok(Location::File(path)) => read_file(&path, entry, allowance.max_size),
+        Err(outcome) => return outcome,
     };
     match retrieved {
         Ok(retrieved) => compare(entry, &retrieved),
@@ -429,22 +467,30 @@ enum Location {
     File(PathBuf),
 }
 
-/// Finds where the resource of `entry` is, or says why it cannot be retrieved.
-fn locate(entry: &LinkedResourceEntry, base: &Base) -> Result<Location, String> {
+/// Finds where the resource of `entry` is, or returns the terminal outcome that says why it
+/// is not retrieved.
+fn locate(entry: &LinkedResourceEntry, base: &Base) -> Result<Location, Outcome> {
     let uri = match entry {
         LinkedResourceEntry::External(resource) => {
-            return remote_url(&resource.url).map(Location::Remote)
+            return remote_url(&resource.url)
+                .map(Location::Remote)
+                .map_err(Outcome::Inaccessible)
         }
         LinkedResourceEntry::Relative { resource, .. } => &resource.uri,
     };
-    check_relative_reference(uri)?;
-    match base {
-        Base::Missing => Err("no base location is set for relative resources".into()),
-        Base::Unusable(reason) => Err(reason.clone()),
-        Base::Url(base) => resolve_url(base, uri).map(Location::Remote),
+    let located = match base {
+        // The same rule as `Base::leaves_skipped`.
+        Base::Missing => return Err(Outcome::Skipped(NO_BASE.into())),
+        Base::Unusable(reason) => check_relative_reference(uri).and_then(|()| Err(reason.clone())),
+        Base::Url(base) => check_relative_reference(uri)
+            .and_then(|()| resolve_url(base, uri))
+            .map(Location::Remote),
         #[cfg(feature = "file_io")]
-        Base::Directory(root) => resolve_file(root, uri).map(Location::File),
-    }
+        Base::Directory(root) => check_relative_reference(uri)
+            .and_then(|()| resolve_file(root, uri))
+            .map(Location::File),
+    };
+    located.map_err(Outcome::Inaccessible)
 }
 
 /// Parses `raw` as a URL to retrieve: `https` only, with no userinfo part.
@@ -578,7 +624,7 @@ struct Retrieved {
     media_type: Option<String>,
 }
 
-/// Retrieves `url` through the HTTP resolver of `context`, within `timeout`.
+/// Retrieves `url` through the HTTP resolver of `context`, within `allowance`.
 ///
 /// A failed retrieval, or one that is too large, is returned as the terminal outcome.
 #[async_generic]
@@ -586,14 +632,14 @@ fn fetch(
     url: &Url,
     entry: &LinkedResourceEntry,
     context: &Context,
-    timeout: Duration,
+    allowance: Allowance,
 ) -> Result<Retrieved, Outcome> {
-    let limit = read_limit(entry)?;
+    let limit = read_limit(entry, allowance.max_size)?;
     // Without content coding the body is the representation the spec has us hash; the
     // built-in clients do not decode `gzip` or other codings.
     let request = Request::get(url.as_str())
         .header(header::ACCEPT_ENCODING, "identity")
-        .extension(RequestTimeout(timeout))
+        .extension(RequestTimeout(allowance.timeout))
         .extension(HttpsRedirectsOnly)
         .body(Vec::new())
         .map_err(|err| Outcome::Inaccessible(format!("request cannot be built: {err}")))?;
@@ -636,7 +682,7 @@ fn read_response(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.parse::<u64>().ok());
         if advertised_length.is_some_and(|length| length > limit) {
-            return Err(exceeds_limit(entry));
+            return Err(exceeds_limit(entry, limit));
         }
     }
     let media_type = headers
@@ -666,10 +712,15 @@ fn content_coding(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Reads the file at `path`, hashing it with the algorithm of `entry`.
+/// Reads the file at `path`, hashing it with the algorithm of `entry`. `max_size` is the
+/// most bytes read when `entry` declares no size.
 #[cfg(feature = "file_io")]
-fn read_file(path: &Path, entry: &LinkedResourceEntry) -> Result<Retrieved, Outcome> {
-    let limit = read_limit(entry)?;
+fn read_file(
+    path: &Path,
+    entry: &LinkedResourceEntry,
+    max_size: u64,
+) -> Result<Retrieved, Outcome> {
+    let limit = read_limit(entry, max_size)?;
     let file = File::open(path)
         .map_err(|err| Outcome::Inaccessible(format!("file cannot be opened: {err}")))?;
     // `resolve_file` checked the path already; this checks the file actually opened.
@@ -682,7 +733,7 @@ fn read_file(path: &Path, entry: &LinkedResourceEntry) -> Result<Retrieved, Outc
         ));
     }
     if metadata.len() > limit {
-        return Err(exceeds_limit(entry));
+        return Err(exceeds_limit(entry, limit));
     }
 
     let (size, hash) = read_representation(file, entry, limit)?;
@@ -693,25 +744,25 @@ fn read_file(path: &Path, entry: &LinkedResourceEntry) -> Result<Retrieved, Outc
     })
 }
 
-/// The most bytes to read for `entry`: its declared size, or [`MAX_RESOURCE_SIZE`].
-fn read_limit(entry: &LinkedResourceEntry) -> Result<u64, Outcome> {
+/// The most bytes to read for `entry`: its declared size, or `max_size` when it declares none.
+fn read_limit(entry: &LinkedResourceEntry, max_size: u64) -> Result<u64, Outcome> {
     match entry.size() {
-        Some(size) if size > MAX_RESOURCE_SIZE => Err(Outcome::Inaccessible(format!(
-            "declared size of {size} bytes exceeds the retrieval limit of {MAX_RESOURCE_SIZE} bytes"
+        Some(size) if size > max_size => Err(Outcome::Inaccessible(format!(
+            "declared size of {size} bytes exceeds the retrieval limit of {max_size} bytes"
         ))),
         Some(size) => Ok(size),
-        None => Ok(MAX_RESOURCE_SIZE),
+        None => Ok(max_size),
     }
 }
 
-/// The outcome for a resource found to be larger than [`read_limit`].
-fn exceeds_limit(entry: &LinkedResourceEntry) -> Outcome {
+/// The outcome for a resource found to be larger than `limit`, its [`read_limit`].
+fn exceeds_limit(entry: &LinkedResourceEntry, limit: u64) -> Outcome {
     match entry.size() {
         Some(size) => {
             Outcome::SizeMismatch(format!("resource is larger than the declared {size} bytes"))
         }
         None => Outcome::Inaccessible(format!(
-            "resource exceeds the retrieval limit of {MAX_RESOURCE_SIZE} bytes"
+            "resource exceeds the retrieval limit of {limit} bytes"
         )),
     }
 }
@@ -726,10 +777,10 @@ fn read_representation(
     entry: &LinkedResourceEntry,
     limit: u64,
 ) -> Result<(u64, Vec<u8>), Outcome> {
-    let (hash, size) = hash_resource(entry.alg(), &mut reader.take(limit + 1))
+    let (hash, size) = hash_resource(entry.alg(), &mut reader.take(limit.saturating_add(1)))
         .map_err(|err| Outcome::Inaccessible(format!("resource cannot be read: {err}")))?;
     if size > limit {
-        return Err(exceeds_limit(entry));
+        return Err(exceeds_limit(entry, limit));
     }
     Ok((size, hash))
 }
@@ -794,6 +845,16 @@ mod tests {
     use crate::{
         assertions::{ExternalResource, UriHashedDataMap},
         http::{AsyncHttpResolver, HttpResolverError, SyncHttpResolver},
+        settings::{
+            DEFAULT_LINKED_RESOURCE_TIMEOUT_IN_MS, DEFAULT_LINKED_RESOURCE_TOTAL_TIMEOUT_IN_MS,
+            DEFAULT_MAX_LINKED_RESOURCE_SIZE,
+        },
+    };
+
+    /// What a retrieval may use under the default settings.
+    const ALLOWANCE: Allowance = Allowance {
+        timeout: Duration::from_millis(DEFAULT_LINKED_RESOURCE_TIMEOUT_IN_MS),
+        max_size: DEFAULT_MAX_LINKED_RESOURCE_SIZE,
     };
 
     const SCRIPT_URL: &str = "https://example.com/assets/main.js";
@@ -946,12 +1007,7 @@ mod tests {
     }
 
     fn retrieve_with(resolver: &MockResolver, entry: &LinkedResourceEntry) -> Outcome {
-        retrieve(
-            entry,
-            &Base::Missing,
-            &resolver.context(),
-            RETRIEVAL_TIMEOUT,
-        )
+        retrieve(entry, &Base::Missing, &resolver.context(), ALLOWANCE)
     }
 
     #[test]
@@ -972,7 +1028,7 @@ mod tests {
         assert_eq!(request.headers()[header::ACCEPT_ENCODING], "identity");
         assert_eq!(
             request.extensions().get::<RequestTimeout>(),
-            Some(&RequestTimeout(RETRIEVAL_TIMEOUT))
+            Some(&RequestTimeout(ALLOWANCE.timeout))
         );
         assert_eq!(
             request.extensions().get::<HttpsRedirectsOnly>(),
@@ -985,13 +1041,7 @@ mod tests {
         let resolver = MockResolver::new([(SCRIPT_URL, Canned::ok("text/javascript", SCRIPT))]);
         let entry = LinkedResourceEntry::External(script());
 
-        let outcome = retrieve_async(
-            &entry,
-            &Base::Missing,
-            &resolver.context(),
-            RETRIEVAL_TIMEOUT,
-        )
-        .await;
+        let outcome = retrieve_async(&entry, &Base::Missing, &resolver.context(), ALLOWANCE).await;
 
         assert_eq!(outcome, MATCH);
         assert_eq!(resolver.requested_urls(), [SCRIPT_URL]);
@@ -1114,10 +1164,13 @@ mod tests {
     #[test]
     fn undeclared_size_is_bounded_by_the_limit() {
         let entry = without_size(LinkedResourceEntry::External(script()));
-        assert_eq!(read_limit(&entry), Ok(MAX_RESOURCE_SIZE));
+        assert_eq!(
+            read_limit(&entry, ALLOWANCE.max_size),
+            Ok(ALLOWANCE.max_size)
+        );
 
         let mut canned = Canned::ok("text/javascript", SCRIPT)
-            .header("content-length", (MAX_RESOURCE_SIZE + 1).to_string());
+            .header("content-length", (ALLOWANCE.max_size + 1).to_string());
         canned.broken_body = true;
         let resolver = MockResolver::new([(SCRIPT_URL, canned)]);
 
@@ -1128,7 +1181,7 @@ mod tests {
 
     #[test]
     fn declared_size_over_the_limit_is_not_requested() {
-        let entry = LinkedResourceEntry::External(script().set_size(MAX_RESOURCE_SIZE + 1));
+        let entry = LinkedResourceEntry::External(script().set_size(ALLOWANCE.max_size + 1));
         let resolver = MockResolver::new([(SCRIPT_URL, Canned::ok("text/javascript", SCRIPT))]);
 
         let outcome = retrieve_with(&resolver, &entry);
@@ -1203,7 +1256,7 @@ mod tests {
                 url: url.to_owned(),
                 ..script()
             });
-            retrieve(&entry, &Base::Missing, &context, RETRIEVAL_TIMEOUT)
+            retrieve(&entry, &Base::Missing, &context, ALLOWANCE)
         };
 
         assert_eq!(retrieve_url(SCRIPT_URL), MATCH);
@@ -1254,13 +1307,27 @@ mod tests {
     }
 
     #[test]
-    fn relative_resource_without_base_is_inaccessible() {
+    fn relative_resource_without_base_is_skipped() {
         let resolver = MockResolver::default();
+        // Not resolved at all, so even a URI that no base would accept is `skipped`.
+        for uri in ["./a.png", "https://example.com/a.png"] {
+            let entry = relative(uri, b"png");
+            assert!(Base::Missing.leaves_skipped(&entry), "{uri}");
 
-        let outcome = retrieve_with(&resolver, &relative("./a.png", b"png"));
+            let outcome = retrieve_with(&resolver, &entry);
 
-        assert_matches!(outcome, Outcome::Inaccessible(detail) if detail.contains("base"));
+            assert_eq!(outcome, Outcome::Skipped(NO_BASE.into()), "{uri}");
+        }
+        assert!(!Base::Missing.leaves_skipped(&LinkedResourceEntry::External(script())));
         assert!(resolver.requested_urls().is_empty());
+
+        let item = Outcome::Skipped(NO_BASE.into()).into_log_item("assertion".into(), "./a.png");
+        assert_eq!(
+            item.validation_status.as_deref(),
+            Some(validation_status::ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED)
+        );
+        assert_eq!(item.kind, LogKind::Informational);
+        assert!(item.description.contains("no base"), "{}", item.description);
     }
 
     #[test]
@@ -1307,7 +1374,7 @@ mod tests {
                 &relative("a.png", b"png"),
                 &base,
                 &resolver.context(),
-                RETRIEVAL_TIMEOUT,
+                ALLOWANCE,
             );
             assert_matches!(outcome, Outcome::Inaccessible(detail) if detail.contains("base URL"));
         }
@@ -1329,7 +1396,7 @@ mod tests {
             &relative("./textures/albedo.png", ALBEDO),
             &base,
             &resolver.context(),
-            RETRIEVAL_TIMEOUT,
+            ALLOWANCE,
         );
 
         assert_eq!(outcome, MATCH);
@@ -1362,7 +1429,7 @@ mod tests {
 
         fn retrieve_in(base: &Path, entry: &LinkedResourceEntry) -> Outcome {
             let base = Base::new(Some(&LinkedResourceBase::Directory(base.to_path_buf())));
-            retrieve(entry, &base, &Context::new(), RETRIEVAL_TIMEOUT)
+            retrieve(entry, &base, &Context::new(), ALLOWANCE)
         }
 
         fn with_dc_format(mut entry: LinkedResourceEntry, dc_format: &str) -> LinkedResourceEntry {
@@ -1677,16 +1744,6 @@ mod tests {
         }
 
         #[test]
-        fn retrievals_per_manifest_are_bounded() {
-            let (claim, validation_log) = claim_and_log(script_entries(MAX_RETRIEVALS + 1));
-
-            assert_eq!(
-                pending_retrievals(&claim, &validation_log).len(),
-                MAX_RETRIEVALS
-            );
-        }
-
-        #[test]
         fn statuses_that_do_not_line_up_are_left_alone() {
             let (claim, mut validation_log) = claim_and_log(script_entries(2));
             validation_log.logged_items_mut()[1].resource_url =
@@ -1709,15 +1766,23 @@ mod tests {
 
     #[test]
     fn deadline_caps_each_retrieval_and_runs_out() {
+        let per_retrieval = ALLOWANCE.timeout;
         assert_eq!(
-            Deadline::start(RETRIEVAL_BUDGET).next_timeout(),
-            Some(RETRIEVAL_TIMEOUT)
+            Deadline::start(
+                Duration::from_millis(DEFAULT_LINKED_RESOURCE_TOTAL_TIMEOUT_IN_MS),
+                per_retrieval
+            )
+            .next_timeout(),
+            Some(per_retrieval)
         );
         assert_matches!(
-            Deadline::start(Duration::from_secs(10)).next_timeout(),
+            Deadline::start(Duration::from_secs(10), per_retrieval).next_timeout(),
             Some(timeout) if timeout <= Duration::from_secs(10)
         );
-        assert_eq!(Deadline::start(Duration::ZERO).next_timeout(), None);
+        assert_eq!(
+            Deadline::start(Duration::ZERO, per_retrieval).next_timeout(),
+            None
+        );
     }
 
     #[test]

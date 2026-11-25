@@ -221,8 +221,8 @@ impl Reader {
     /// assertions resolve against. Call it before reading.
     ///
     /// The base matters only when the `verify.fetch_linked_resources` setting is on. Without
-    /// a base, relative resources are reported as
-    /// `assertion.linkedResourceIntegrity.inaccessible`. The SDK does not derive a base from
+    /// a base, relative resources are not retrieved and stay
+    /// `assertion.linkedResourceIntegrity.skipped`. The SDK does not derive a base from
     /// the asset, not even with [`with_file`](Self::with_file): resolving the URIs reads
     /// files or URLs that the manifest names, so the application chooses where. To resolve
     /// them next to a file, pass its directory as `LinkedResourceBase::Directory`. See

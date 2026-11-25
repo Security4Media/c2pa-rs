@@ -149,19 +149,27 @@ The media type compared with `dc:format` is the `Content-Type` of the response, 
 `application/octet-stream` without one. Type and subtype are compared without regard to case,
 and parameters such as `charset` are ignored.
 
-Each retrieval may take up to 60 seconds, redirects included, and all the retrievals of one
-manifest together up to 5 minutes. The built-in `ureq` and native `reqwest` resolvers apply the
-limit to each retrieval; on WASI and in a browser, a single retrieval is bounded only by the
-platform. At most 100 resources are retrieved per manifest, and resources not attempted within
-these limits stay `skipped`. The SDK reads at most the declared `size` of a resource, or
-256 MiB when it has none. Like `verify.max_manifest_response_size`, this limit applies after
-the HTTP resolver returns: it does not bound buffering inside a resolver, and the built-in
-reqwest adapters read the whole body before returning.
+Four settings bound retrieval. Resources not attempted within them stay `skipped`.
+
+| Setting | Default | What it limits |
+| -- | -- | -- |
+| `verify.max_linked_resources` | `100` | Resources retrieved per manifest. |
+| `verify.max_linked_resource_size` | `268435456` (256 MiB) | Bytes read for a resource without a declared `size`. A larger declared `size` is `inaccessible` without a request. |
+| `verify.linked_resource_timeout_in_ms` | `60000` (60 s) | One retrieval, redirects included. |
+| `verify.linked_resource_total_timeout_in_ms` | `300000` (5 min) | All the retrievals of one manifest, one after another. |
+
+Each value must be at least 1. The built-in `ureq` and native `reqwest` resolvers apply the
+per-retrieval time limit; on WASI and in a browser, a single retrieval is bounded only by the
+platform. The SDK reads at most the declared `size` of a resource, or
+`verify.max_linked_resource_size` when it has none. Like `verify.max_manifest_response_size`,
+this limit applies after the HTTP resolver returns: it does not bound buffering inside a
+resolver, and the built-in reqwest adapters read the whole body before returning.
 
 Relative resources resolve against a base location given on the `Reader`: a local directory
-(with the `file_io` feature) or the `https` URL of the asset. Without one, they are reported
-as `inaccessible`. The SDK does not derive a base from the asset, not even with `with_file`,
-so pass the directory of the file when its resources sit next to it. In a directory, each
+(with the `file_io` feature) or the `https` URL of the asset. Without one, they are not
+retrieved and stay `skipped`, with an explanation saying that no base is set; they do not
+count toward `verify.max_linked_resources`. The SDK does not derive a base from the asset, not
+even with `with_file`, so pass the directory of the file when its resources sit next to it. In a directory, each
 `/`-delimited segment of a URI is percent-decoded on its own, so an encoded `/` is refused, and
 `dc:format` is not compared because a file has no media type.
 
@@ -184,7 +192,11 @@ Equivalent JSON configuration:
 ```json
 {
   "verify": {
-    "fetch_linked_resources": true
+    "fetch_linked_resources": true,
+    "max_linked_resources": 100,
+    "max_linked_resource_size": 268435456,
+    "linked_resource_timeout_in_ms": 60000,
+    "linked_resource_total_timeout_in_ms": 300000
   }
 }
 ```
