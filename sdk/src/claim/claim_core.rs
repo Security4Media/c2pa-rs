@@ -1843,6 +1843,18 @@ impl Claim {
         self.assertions_by_type(&dummy_certificate_status, None)
     }
 
+    /// Returns the list of linked resource integrity assertions, created or gathered.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub(crate) fn linked_resource_integrity_assertions(&self) -> Vec<&ClaimAssertion> {
+        let dummy_data = AssertionData::Cbor(Vec::new());
+        let dummy_linked_resource_integrity = Assertion::new(
+            assertions::labels::LINKED_RESOURCE_INTEGRITY,
+            None,
+            dummy_data,
+        );
+        self.assertions_by_type(&dummy_linked_resource_integrity, None)
+    }
+
     /// Return list of action assertions.
     /// Created assertions have higher priority than gathered assertions
     pub fn action_assertions(&self) -> Vec<&ClaimAssertion> {

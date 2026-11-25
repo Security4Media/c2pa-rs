@@ -141,6 +141,13 @@ pub struct LogItem {
 
     /// Trust list URI (for trust list-related logs)
     pub trust_list_uri: Option<Cow<'static, str>>,
+
+    /// `url` or `uri` of the assertion entry this item applies to. The validation status made
+    /// from this item carries it as `resourceUrl`, instead of the `url` taken from `label`.
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub resource_url: Option<Cow<'static, str>>,
 }
 
 impl Default for LogItem {
@@ -158,6 +165,8 @@ impl Default for LogItem {
             validation_status: None,
             ingredient_uri: None,
             trust_list_uri: None,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            resource_url: None,
         }
     }
 }
@@ -226,6 +235,28 @@ impl LogItem {
     pub fn set_trust_list_uri<S: Into<String>>(self, uri: S) -> Self {
         LogItem {
             trust_list_uri: Some(uri.into().into()),
+            ..self
+        }
+    }
+
+    /// Add the `url` or `uri` of the assertion entry this item applies to.
+    ///
+    /// The validation status made from this item carries it as `resourceUrl` instead of
+    /// a `url`.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// # use c2pa::log_item;
+    /// let log = log_item!("test1", "test item 1", "test func")
+    ///     .set_resource_url("https://example.com/assets/main.js");
+    /// ```
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub fn set_resource_url<S: Into<String>>(self, url: S) -> Self {
+        LogItem {
+            resource_url: Some(url.into().into()),
             ..self
         }
     }
@@ -379,6 +410,8 @@ mod tests {
                 validation_status: None,
                 ingredient_uri: None,
                 trust_list_uri: None,
+                #[cfg(feature = "unstable_linked_resource_integrity")]
+                resource_url: None,
             }
         );
     }

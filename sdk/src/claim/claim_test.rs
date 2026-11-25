@@ -1871,3 +1871,312 @@ fn test_inside_validity_not_reported_with_outside_validity() {
     verify(&mut validation_log);
     assert!(validation_log.has_status(validation_status::CLAIM_SIGNATURE_INSIDE_VALIDITY));
 }
+
+#[cfg(feature = "unstable_linked_resource_integrity")]
+mod linked_resource_integrity {
+    use std::assert_matches;
+
+    use super::*;
+    use crate::{
+        assertions::{
+            ExternalResource, LinkedResourceFinding, LinkedResourceIntegrity, UriHashedDataMap,
+        },
+        status_tracker::LogKind,
+        utils::json_b64::from_json_b64,
+        validation_status::{
+            ValidationStatus, ALGORITHM_DEPRECATED, ALGORITHM_UNSUPPORTED,
+            ASSERTION_LINKED_RESOURCE_INTEGRITY_INVALID_URI as INVALID_URI,
+            ASSERTION_LINKED_RESOURCE_INTEGRITY_MALFORMED as MALFORMED,
+            ASSERTION_LINKED_RESOURCE_INTEGRITY_NOT_CREATED as NOT_CREATED,
+            ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED as SKIPPED,
+        },
+    };
+
+    const SCRIPT_URL: &str = "https://example.com/assets/main.js";
+    const STYLE_URL: &str = "https://example.com/assets/style.css";
+
+    fn external_lri() -> LinkedResourceIntegrity {
+        LinkedResourceIntegrity::external(vec![
+            ExternalResource::from_bytes(SCRIPT_URL, "sha256", b"console.log(1);").unwrap(),
+            ExternalResource::from_bytes(STYLE_URL, "sha256", b"body {}").unwrap(),
+        ])
+        .set_all_uris_included(true)
+    }
+
+    /// An assertion with the linked resource integrity label and arbitrary content, given in
+    /// json_b64 form.
+    struct RawLinkedResourceIntegrity(Value);
+
+    impl AssertionBase for RawLinkedResourceIntegrity {
+        const LABEL: &'static str = LinkedResourceIntegrity::LABEL;
+
+        fn to_assertion(&self) -> Result<Assertion> {
+            let value = from_json_b64(&self.0)?;
+            Ok(Assertion::new(
+                Self::LABEL,
+                None,
+                AssertionData::Cbor(c2pa_cbor::to_vec(&value)?),
+            ))
+        }
+
+        fn from_assertion(_assertion: &Assertion) -> Result<Self> {
+            unimplemented!("not needed for these tests")
+        }
+    }
+
+    fn verify_with(claim: &Claim, svi: &StoreValidationInfo) -> StatusTracker {
+        let mut validation_log = StatusTracker::default();
+        Claim::verify_linked_resource_integrity(claim, svi, &mut validation_log).unwrap();
+        validation_log
+    }
+
+    fn verify(claim: &Claim) -> StatusTracker {
+        verify_with(claim, &StoreValidationInfo::default())
+    }
+
+    /// The status code and `resource_url` of every logged item, in order.
+    fn statuses(validation_log: &StatusTracker) -> Vec<(&str, Option<&str>)> {
+        validation_log
+            .logged_items()
+            .iter()
+            .map(|item| {
+                (
+                    item.validation_status.as_deref().unwrap_or_default(),
+                    item.resource_url.as_deref(),
+                )
+            })
+            .collect()
+    }
+
+    fn lri_uri(claim: &Claim) -> String {
+        to_assertion_uri(claim.label(), LinkedResourceIntegrity::LABEL)
+    }
+
+    #[test]
+    fn created_assertion_reports_each_entry_as_skipped() {
+        let mut claim = create_test_claim().unwrap();
+        claim.add_created_assertion(&external_lri()).unwrap();
+
+        let validation_log = verify(&claim);
+
+        assert_eq!(
+            statuses(&validation_log),
+            [(SKIPPED, Some(SCRIPT_URL)), (SKIPPED, Some(STYLE_URL))]
+        );
+        for item in validation_log.logged_items() {
+            assert_eq!(item.kind, LogKind::Informational);
+            assert_eq!(item.label, lri_uri(&claim));
+        }
+        assert!(!validation_log.has_any_error());
+    }
+
+    #[test]
+    fn skipped_status_carries_resource_url_instead_of_url() {
+        let mut claim = create_test_claim().unwrap();
+        claim.add_created_assertion(&external_lri()).unwrap();
+        let validation_log = verify(&claim);
+
+        let status = ValidationStatus::from_log_item(&validation_log.logged_items()[0]).unwrap();
+
+        assert_eq!(status.code(), SKIPPED);
+        assert_eq!(status.url(), None);
+        assert_eq!(status.resource_url(), Some(SCRIPT_URL));
+        assert_eq!(status.kind(), &LogKind::Informational);
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["resourceUrl"], SCRIPT_URL);
+        assert!(json.get("url").is_none());
+    }
+
+    #[test]
+    fn gathered_assertion_is_not_created() {
+        let mut claim = create_test_claim().unwrap();
+        claim.add_assertion(&external_lri()).unwrap();
+
+        let validation_log = verify(&claim);
+
+        assert_eq!(
+            statuses(&validation_log),
+            [
+                (NOT_CREATED, None),
+                (SKIPPED, Some(SCRIPT_URL)),
+                (SKIPPED, Some(STYLE_URL))
+            ]
+        );
+        let not_created = &validation_log.logged_items()[0];
+        assert_eq!(not_created.kind, LogKind::Failure);
+        assert_eq!(not_created.label, lri_uri(&claim));
+    }
+
+    #[test]
+    fn v1_claim_assertion_is_not_created() {
+        let mut claim = create_test_claim_v1().unwrap();
+        claim.add_assertion(&external_lri()).unwrap();
+
+        let validation_log = verify(&claim);
+
+        assert_eq!(statuses(&validation_log)[0], (NOT_CREATED, None));
+    }
+
+    #[test]
+    fn stop_on_first_error_aborts_on_rejection() {
+        let mut claim = create_test_claim().unwrap();
+        claim.add_assertion(&external_lri()).unwrap();
+        let mut validation_log =
+            StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
+
+        let result = Claim::verify_linked_resource_integrity(
+            &claim,
+            &StoreValidationInfo::default(),
+            &mut validation_log,
+        );
+
+        assert_matches!(result, Err(Error::ValidationRule(_)));
+        assert!(validation_log.has_status(NOT_CREATED));
+    }
+
+    #[test]
+    fn malformed_assertion_has_no_terminal_codes() {
+        let mut claim = create_test_claim().unwrap();
+        claim
+            .add_created_assertion(&RawLinkedResourceIntegrity(json!({
+                "resources": { "externalResources": [] }
+            })))
+            .unwrap();
+
+        let validation_log = verify(&claim);
+
+        assert_eq!(statuses(&validation_log), [(MALFORMED, None)]);
+        assert_eq!(validation_log.logged_items()[0].kind, LogKind::Failure);
+    }
+
+    #[test]
+    fn malformed_entry_is_reported_with_its_url() {
+        let mut claim = create_test_claim().unwrap();
+        claim
+            .add_created_assertion(&RawLinkedResourceIntegrity(json!({
+                "resources": { "externalResources": [
+                    { "url": SCRIPT_URL, "alg": "sha256" },
+                    { "url": STYLE_URL, "alg": "sha256", "hash": "b64'AAEC'" }
+                ]}
+            })))
+            .unwrap();
+
+        let validation_log = verify(&claim);
+
+        assert_eq!(
+            statuses(&validation_log),
+            [(MALFORMED, Some(SCRIPT_URL)), (SKIPPED, Some(STYLE_URL))]
+        );
+    }
+
+    #[test]
+    fn traversal_uri_is_rejected_and_still_gets_a_terminal_code() {
+        let mut lri = LinkedResourceIntegrity::relative("sha256", Vec::new());
+        lri.add_relative_from_bytes("%2e%2e/secret.png", b"secret")
+            .unwrap();
+        lri.add_relative_from_bytes("./textures/albedo.png", b"albedo")
+            .unwrap();
+        let mut claim = create_test_claim().unwrap();
+        claim.add_created_assertion(&lri).unwrap();
+
+        let validation_log = verify(&claim);
+
+        assert_eq!(
+            statuses(&validation_log),
+            [
+                (INVALID_URI, Some("%2e%2e/secret.png")),
+                (SKIPPED, Some("%2e%2e/secret.png")),
+                (SKIPPED, Some("./textures/albedo.png"))
+            ]
+        );
+        assert_eq!(validation_log.logged_items()[0].kind, LogKind::Failure);
+    }
+
+    #[test]
+    fn unsupported_entry_algorithm_is_reported_with_its_url() {
+        let mut claim = create_test_claim().unwrap();
+        claim
+            .add_created_assertion(&LinkedResourceIntegrity::external(vec![
+                ExternalResource::new(SCRIPT_URL, "md5", vec![0; 16]),
+            ]))
+            .unwrap();
+
+        let validation_log = verify(&claim);
+
+        assert_eq!(
+            statuses(&validation_log),
+            [
+                (ALGORITHM_UNSUPPORTED, Some(SCRIPT_URL)),
+                (SKIPPED, Some(SCRIPT_URL))
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_shared_algorithm_is_reported_on_the_assertion() {
+        let mut entry = UriHashedDataMap::new("textures/albedo.png".to_owned());
+        entry.hash = Some(vec![0; 20]);
+        let mut claim = create_test_claim().unwrap();
+        claim
+            .add_created_assertion(&LinkedResourceIntegrity::relative("sha1", vec![entry]))
+            .unwrap();
+
+        let validation_log = verify(&claim);
+
+        assert_eq!(
+            statuses(&validation_log),
+            [
+                (ALGORITHM_UNSUPPORTED, None),
+                (SKIPPED, Some("textures/albedo.png"))
+            ]
+        );
+        assert_eq!(validation_log.logged_items()[0].label, lri_uri(&claim));
+    }
+
+    #[test]
+    fn deprecated_algorithm_is_informational() {
+        let mut validation_log =
+            StatusTracker::with_error_behavior(ErrorBehavior::StopOnFirstError);
+
+        Claim::log_linked_resource_finding(
+            "self#jumbf=c2pa.assertions/c2pa.linked-resource-integrity",
+            &LinkedResourceFinding::DeprecatedAlgorithm {
+                alg: "sha1".to_owned(),
+                resource_url: Some(SCRIPT_URL.to_owned()),
+            },
+            &mut validation_log,
+        )
+        .unwrap();
+
+        assert_eq!(
+            statuses(&validation_log),
+            [(ALGORITHM_DEPRECATED, Some(SCRIPT_URL))]
+        );
+        assert_eq!(
+            validation_log.logged_items()[0].kind,
+            LogKind::Informational
+        );
+    }
+
+    #[test]
+    fn redacted_assertion_keeps_only_the_placement_check() {
+        let malformed = RawLinkedResourceIntegrity(json!({ "resources": {} }));
+        let redacted = |claim: &Claim| StoreValidationInfo {
+            redactions: vec![lri_uri(claim)],
+            ..Default::default()
+        };
+
+        let mut created = create_test_claim().unwrap();
+        created.add_created_assertion(&malformed).unwrap();
+        assert!(verify_with(&created, &redacted(&created))
+            .logged_items()
+            .is_empty());
+
+        let mut gathered = create_test_claim().unwrap();
+        gathered.add_assertion(&malformed).unwrap();
+        assert_eq!(
+            statuses(&verify_with(&gathered, &redacted(&gathered))),
+            [(NOT_CREATED, None)]
+        );
+    }
+}

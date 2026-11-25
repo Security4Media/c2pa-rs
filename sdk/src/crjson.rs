@@ -459,6 +459,18 @@ impl<'a> CrJsonExporter<'a> {
                     "hash": base64::encode_b64_wrapped(ca.hash())
                 })))
             }
+            // The resource entries of a linked resource integrity assertion are not hashed
+            // URIs: their hashes are already base64, and the crJSON schema allows no `pad`
+            // beside them, so only the metadata goes through `fix_hash_encoding`.
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            _ if ca.label_raw() == assertion_labels::LINKED_RESOURCE_INTEGRITY => {
+                Ok(assertion.as_json_object().ok().map(|mut value| {
+                    if let Some(metadata) = value.get_mut("metadata") {
+                        *metadata = fix_hash_encoding(metadata.take());
+                    }
+                    value
+                }))
+            }
             _ => Ok(assertion.as_json_object().ok().map(fix_hash_encoding)),
         }
     }

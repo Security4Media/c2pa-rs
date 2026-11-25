@@ -271,6 +271,8 @@ pub use external_manifest::ManifestPatchCallback;
 pub use hash_utils::{hash_stream_by_alg, HashRange};
 pub use hashed_uri::HashedUri;
 pub use ingredient::Ingredient;
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub use linked_resource_retrieval::LinkedResourceBase;
 pub use manifest::{Manifest, SignatureInfo};
 pub use manifest_assertion::{ManifestAssertion, ManifestAssertionKind};
 pub use reader::Reader;
@@ -302,6 +304,8 @@ pub(crate) mod ingredient;
 #[allow(dead_code)]
 pub(crate) mod jumbf;
 
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub(crate) mod linked_resource_retrieval;
 pub(crate) mod manifest;
 pub(crate) mod manifest_assertion;
 pub(crate) mod manifest_store_report;

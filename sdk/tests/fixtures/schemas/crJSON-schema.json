@@ -446,6 +446,9 @@
                 },
                 "c2pa.soft-binding": {
                     "$ref": "#/definitions/softBindingAssertion"
+                },
+                "c2pa.linked-resource-integrity": {
+                    "$ref": "#/definitions/linkedResourceIntegrityAssertion"
                 }
             },
             "patternProperties": {
@@ -1517,6 +1520,112 @@
             ],
             "additionalProperties": false
         },
+        "linkedResourceIntegrityAssertion": {
+            "type": "object",
+            "description": "Linked resource integrity assertion (c2pa.linked-resource-integrity). CDDL: linked-resource-integrity.cddl linked-resource-integrity-map.",
+            "required": [
+                "resources"
+            ],
+            "properties": {
+                "resources": {
+                    "description": "The resources - either external or relative - that are part of the asset, and their associated hashes",
+                    "oneOf": [
+                        {
+                            "$ref": "#/definitions/externalResourcesMap"
+                        },
+                        {
+                            "$ref": "#/definitions/relativeResourcesMap"
+                        }
+                    ]
+                },
+                "allURIsIncluded": {
+                    "type": "boolean",
+                    "description": "If true, all URIs embedded in the container format are covered by this assertion. If false or absent, additional unreferenced URIs may exist."
+                },
+                "metadata": {
+                    "$ref": "#/definitions/assertionMetadataMap"
+                }
+            },
+            "additionalProperties": false
+        },
+        "externalResourcesMap": {
+            "type": "object",
+            "description": "External resources with cryptographic hashes, used when the container format only supports absolute references. CDDL: linked-resource-integrity.cddl external-resources-map.",
+            "required": [
+                "externalResources"
+            ],
+            "properties": {
+                "externalResources": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "$ref": "#/definitions/hashedExtUriMap"
+                    },
+                    "description": "External resources identified by absolute URL, each with its own hash and alg"
+                }
+            },
+            "additionalProperties": false
+        },
+        "relativeResourcesMap": {
+            "type": "object",
+            "description": "Relative resources with cryptographic hashes, used when the container format supports references relative to the asset. CDDL: linked-resource-integrity.cddl relative-resources-map.",
+            "required": [
+                "relativeResources",
+                "alg"
+            ],
+            "properties": {
+                "relativeResources": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "$ref": "#/definitions/uriHashedDataMap"
+                    },
+                    "description": "Resources identified by a URI relative to the asset"
+                },
+                "alg": {
+                    "type": "string",
+                    "description": "Cryptographic hash algorithm used to compute the hash on each entry of the relativeResources array (C2PA hash algorithm identifier list)"
+                }
+            },
+            "additionalProperties": false
+        },
+        "uriHashedDataMap": {
+            "type": "object",
+            "description": "Reference to a resource by relative URI and its hash. CDDL: uri-hashed-data.cddl $uri-hashed-data-map.",
+            "required": [
+                "uri",
+                "hash"
+            ],
+            "properties": {
+                "uri": {
+                    "type": "string",
+                    "description": "Relative URI reference"
+                },
+                "hash": {
+                    "type": "string",
+                    "description": "Hash value (Base64-encoded with b64' prefix)"
+                },
+                "size": {
+                    "type": "integer",
+                    "description": "Number of bytes of data"
+                },
+                "dc:format": {
+                    "type": "string",
+                    "description": "IANA media type of the data"
+                },
+                "data_types": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "description": "Asset type per C2PA CDDL $asset-type-map",
+                        "additionalProperties": true
+                    },
+                    "description": "Additional information about the data's type"
+                }
+            },
+            "additionalProperties": false
+        },
         "thumbnailAssertion": {
             "type": "object",
             "description": "Thumbnail assertion (e.g. c2pa.thumbnail.claim.jpeg, c2pa.thumbnail.ingredient.jpeg). No CDDL in INTERNAL/cddl; structure is CrJSON/schema-defined.",
@@ -1786,7 +1895,7 @@
         },
         "validationStatusEntry": {
             "type": "object",
-            "description": "Single validation status (code, optional url and explanation). CDDL: validation-results.cddl status-map.",
+            "description": "Single validation status (code, optional url or resourceUrl, and explanation). CDDL: validation-results.cddl status-map. At most one of url and resourceUrl may be present.",
             "properties": {
                 "code": {
                     "type": "string",
@@ -1796,10 +1905,17 @@
                     "type": "string",
                     "description": "JUMBF URI where status applies"
                 },
+                "resourceUrl": {
+                    "type": "string",
+                    "description": "The url or uri value of the specific entry (e.g. in a linked resource integrity assertion) to which this status code applies"
+                },
                 "explanation": {
                     "type": "string",
                     "description": "Human-readable explanation"
                 }
+            },
+            "not": {
+                "required": ["url", "resourceUrl"]
             },
             "required": [
                 "code"

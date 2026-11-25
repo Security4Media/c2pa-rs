@@ -41,6 +41,12 @@ pub struct ValidationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     url: Option<String>,
 
+    // The spec's `status-map` allows at most one of `url` and `resourceUrl`; the
+    // setters keep them exclusive.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    #[serde(rename = "resourceUrl", skip_serializing_if = "Option::is_none")]
+    resource_url: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     explanation: Option<String>,
 
@@ -57,6 +63,13 @@ pub struct ValidationStatus {
 
     #[serde(skip)]
     trust_list_uri: Option<String>,
+
+    // `resourceUrl` takes the place of the `url` that would name the assertion, and with it
+    // its manifest. This keeps that manifest label, so that de-duplication can match the
+    // status against what that manifest's ingredient recorded. It is not serialized.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    #[serde(skip)]
+    resource_manifest: Option<String>,
 }
 
 fn default_log_kind() -> LogKind {
@@ -68,11 +81,15 @@ impl ValidationStatus {
         Self {
             code: code.into(),
             url: None,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            resource_url: None,
             explanation: None,
             success: None,
             ingredient_uri: None,
             kind: LogKind::Success,
             trust_list_uri: None,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            resource_manifest: None,
         }
     }
 
@@ -96,6 +113,34 @@ impl ValidationStatus {
         self.url.as_deref()
     }
 
+    /// Returns the `url` or `uri` of the assertion entry this status applies to, such as
+    /// one resource listed in a linked resource integrity assertion.
+    ///
+    /// A status has at most one of [`url`](Self::url) and `resource_url`. It is serialized
+    /// as `resourceUrl`.
+    ///
+    /// See [Linked resource integrity validation - C2PA Technical Specification](https://spec.c2pa.org/specifications/specifications/2.5/specs/C2PA_Specification.html#_c2pa_linked_resource_integrity_validation).
+    ///
+    /// <div class="warning">
+    ///
+    /// **Experimental.** This method is available only with the
+    /// `unstable_linked_resource_integrity` feature enabled. It is exempt from this crate's
+    /// usual semantic-versioning stability guarantees and may change in a backward-incompatible
+    /// way, or be removed entirely, in any release.
+    ///
+    /// </div>
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub fn resource_url(&self) -> Option<&str> {
+        self.resource_url.as_deref()
+    }
+
+    /// Returns the label of the manifest whose assertion a [`resource_url`](Self::resource_url)
+    /// status is about, when it was made from a log item.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub(crate) fn resource_manifest(&self) -> Option<&str> {
+        self.resource_manifest.as_deref()
+    }
+
     /// Returns a human-readable description of the validation that was performed.
     pub fn explanation(&self) -> Option<&str> {
         self.explanation.as_deref()
@@ -114,6 +159,19 @@ impl ValidationStatus {
     /// Sets the internal JUMBF reference to the entity was validated.
     pub fn set_url<S: Into<String>>(mut self, url: S) -> Self {
         self.url = Some(url.into());
+        #[cfg(feature = "unstable_linked_resource_integrity")]
+        {
+            self.resource_url = None;
+        }
+        self
+    }
+
+    /// Sets the `url` or `uri` of the assertion entry this status applies to and clears
+    /// [`url`](Self::url), which the spec does not allow alongside it.
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub(crate) fn set_resource_url<S: Into<String>>(mut self, resource_url: S) -> Self {
+        self.resource_url = Some(resource_url.into());
+        self.url = None;
         self
     }
 
@@ -203,6 +261,12 @@ impl ValidationStatus {
                     vi = vi.set_trust_list_uri(trust_list_uri.to_string());
                 }
 
+                #[cfg(feature = "unstable_linked_resource_integrity")]
+                if let Some(resource_url) = &item.resource_url {
+                    vi.resource_manifest = jumbf::labels::manifest_label_from_uri(&item.label);
+                    vi = vi.set_resource_url(resource_url.to_string());
+                }
+
                 vi
             }),
             // If we don't have a validation_status, then make one from the err_val
@@ -229,6 +293,12 @@ impl ValidationStatus {
 
 impl PartialEq for ValidationStatus {
     fn eq(&self, other: &Self) -> bool {
+        // Statuses about different entries of one assertion differ only in `resourceUrl`, so
+        // it must take part for de-duplication to keep them apart.
+        #[cfg(feature = "unstable_linked_resource_integrity")]
+        if self.resource_url != other.resource_url {
+            return false;
+        }
         self.code == other.code && self.url == other.url && self.kind == other.kind
     }
 }
@@ -268,5 +338,121 @@ mod tests {
             !status.passed(),
             "hash mismatch must not be a passing status"
         );
+    }
+
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    mod resource_url {
+        #![allow(clippy::unwrap_used)]
+
+        use serde_json::json;
+
+        use super::*;
+        use crate::log_item;
+
+        const RESOURCE_URL: &str = "https://example.com/assets/main.js";
+        const ASSERTION_URL: &str = "self#jumbf=c2pa.assertions/c2pa.linked-resource-integrity";
+
+        #[test]
+        fn url_and_resource_url_are_exclusive() {
+            let status = ValidationStatus::new(ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED)
+                .set_url(ASSERTION_URL)
+                .set_resource_url(RESOURCE_URL);
+            assert_eq!(status.url(), None);
+            assert_eq!(status.resource_url(), Some(RESOURCE_URL));
+
+            let status = status.set_url(ASSERTION_URL);
+            assert_eq!(status.url(), Some(ASSERTION_URL));
+            assert_eq!(status.resource_url(), None);
+        }
+
+        #[test]
+        fn log_item_resource_url_replaces_url() {
+            let item = log_item!(ASSERTION_URL, "not retrieved", "test")
+                .set_resource_url(RESOURCE_URL)
+                .validation_status(ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED);
+
+            let status = ValidationStatus::from_log_item(&item).unwrap();
+
+            assert_eq!(status.url(), None);
+            assert_eq!(status.resource_url(), Some(RESOURCE_URL));
+        }
+
+        #[test]
+        fn log_item_resource_url_keeps_the_manifest_of_its_assertion() {
+            let assertion = crate::jumbf::labels::to_assertion_uri(
+                "urn:c2pa:manifest",
+                "c2pa.linked-resource-integrity",
+            );
+            let item = log_item!(assertion, "not retrieved", "test")
+                .set_resource_url(RESOURCE_URL)
+                .validation_status(ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED);
+
+            let status = ValidationStatus::from_log_item(&item).unwrap();
+
+            assert_eq!(status.resource_manifest(), Some("urn:c2pa:manifest"));
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(
+                json.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ["code", "resourceUrl", "explanation"]
+            );
+        }
+
+        #[test]
+        fn resource_url_serializes_as_resource_url() {
+            let status = ValidationStatus::new(ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED)
+                .set_resource_url(RESOURCE_URL);
+
+            let json = serde_json::to_value(&status).unwrap();
+            assert_eq!(
+                json,
+                json!({
+                    "code": ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED,
+                    "resourceUrl": RESOURCE_URL
+                })
+            );
+
+            let parsed: ValidationStatus = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed.resource_url(), Some(RESOURCE_URL));
+            assert_eq!(parsed.url(), None);
+        }
+
+        #[test]
+        fn statuses_for_different_resources_differ() {
+            let skipped = |url: &str| {
+                ValidationStatus::new(ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED)
+                    .set_kind(LogKind::Informational)
+                    .set_resource_url(url)
+            };
+
+            assert_eq!(skipped(RESOURCE_URL), skipped(RESOURCE_URL));
+            assert_ne!(
+                skipped(RESOURCE_URL),
+                skipped("https://example.com/assets/style.css")
+            );
+        }
+
+        #[test]
+        fn linked_resource_codes_have_their_log_kind() {
+            assert_eq!(
+                log_kind(ASSERTION_LINKED_RESOURCE_INTEGRITY_MATCH),
+                LogKind::Success
+            );
+            for code in [
+                ASSERTION_LINKED_RESOURCE_INTEGRITY_SKIPPED,
+                ASSERTION_LINKED_RESOURCE_INTEGRITY_INACCESSIBLE,
+                ASSERTION_LINKED_RESOURCE_INTEGRITY_SIZE_MISMATCH,
+                ASSERTION_LINKED_RESOURCE_INTEGRITY_FORMAT_MISMATCH,
+                ASSERTION_LINKED_RESOURCE_INTEGRITY_HASH_MISMATCH,
+            ] {
+                assert_eq!(log_kind(code), LogKind::Informational, "{code}");
+            }
+            for code in [
+                ASSERTION_LINKED_RESOURCE_INTEGRITY_MALFORMED,
+                ASSERTION_LINKED_RESOURCE_INTEGRITY_NOT_CREATED,
+                ASSERTION_LINKED_RESOURCE_INTEGRITY_INVALID_URI,
+            ] {
+                assert_eq!(log_kind(code), LogKind::Failure, "{code}");
+            }
+        }
     }
 }

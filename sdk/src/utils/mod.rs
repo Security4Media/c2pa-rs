@@ -33,6 +33,8 @@ pub(crate) mod path_utils;
 #[cfg(feature = "add_thumbnails")]
 pub(crate) mod thumbnail;
 pub(crate) mod time_it;
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub(crate) mod uri_utils;
 #[allow(dead_code)] // for wasm builds
 pub(crate) mod xmp_inmemory_utils;
 // shared unit testing utilities

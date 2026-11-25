@@ -287,6 +287,39 @@ pub(crate) fn is_uri_allowed(patterns: &[HostPattern], uri: &Uri) -> bool {
 /// Maximum number of HTTP redirects [`RedirectResolver`] will follow before giving up.
 const MAX_REDIRECTS: usize = 10;
 
+/// Request extension that makes [`RedirectResolver`] refuse a redirect to a URL that is not
+/// `https` or that has a userinfo part, the rules the SDK applies to linked resource URLs
+/// before the first request.
+#[cfg(feature = "unstable_linked_resource_integrity")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HttpsRedirectsOnly;
+
+/// Returns an error if `extensions` hold [`HttpsRedirectsOnly`] and `target` breaks its rules.
+#[cfg(feature = "unstable_linked_resource_integrity")]
+fn check_https_redirect(
+    extensions: &http::Extensions,
+    from_uri: &Uri,
+    target: &Uri,
+) -> Result<(), HttpResolverError> {
+    let has_userinfo = target
+        .authority()
+        .is_some_and(|authority| authority.as_str().contains('@'));
+    if extensions.get::<HttpsRedirectsOnly>().is_some()
+        && (target.scheme_str() != Some("https") || has_userinfo)
+    {
+        return Err(HttpResolverError::Other(
+            format!(
+                "HTTP redirect to \"{}\" (from \"{}\") was not followed: the request accepts \
+                 only https targets without a userinfo part",
+                sanitize_for_log(&target.to_string()),
+                sanitize_for_log(&from_uri.to_string())
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolver wrapper that follows HTTP redirects at the SDK layer, validating each hop.
 ///
 /// The underlying client is configured not to follow redirects on its own (`max_redirects(0)` /
@@ -321,11 +354,17 @@ impl<T> RedirectResolver<T> {
     ///
     /// Returns `Ok(None)` if the response is not a redirect (the caller returns it as-is), or
     /// `Ok(Some(target))` with the validated redirect target to re-issue. Errors if redirects are
-    /// disabled or the target is disallowed.
+    /// disabled or the target is disallowed, by default or by a rule in the request
+    /// `extensions`.
     fn redirect_target<B>(
         &self,
         from_uri: &Uri,
         response: &Response<B>,
+        #[cfg_attr(
+            not(feature = "unstable_linked_resource_integrity"),
+            allow(unused_variables)
+        )]
+        extensions: &http::Extensions,
     ) -> Result<Option<Uri>, HttpResolverError> {
         let Some(location) = redirect_location(response) else {
             return Ok(None);
@@ -345,6 +384,8 @@ impl<T> RedirectResolver<T> {
                 location: sanitize_for_log(&target.to_string()),
             });
         }
+        #[cfg(feature = "unstable_linked_resource_integrity")]
+        check_https_redirect(extensions, from_uri, &target)?;
 
         Ok(Some(target))
     }
@@ -370,7 +411,7 @@ impl<T: SyncHttpResolver> SyncHttpResolver for RedirectResolver<T> {
 
             let response = self.inner.http_resolve(request)?;
 
-            match self.redirect_target(&from_uri, &response)? {
+            match self.redirect_target(&from_uri, &response, &extensions)? {
                 None => return Ok(response),
                 Some(target) => {
                     request = build_redirected_request(method, headers, body, target)?;
@@ -407,7 +448,7 @@ impl<T: AsyncHttpResolver + Sync> AsyncHttpResolver for RedirectResolver<T> {
 
             let response = self.inner.http_resolve_async(request).await?;
 
-            match self.redirect_target(&from_uri, &response)? {
+            match self.redirect_target(&from_uri, &response, &extensions)? {
                 None => return Ok(response),
                 Some(target) => {
                     request = build_redirected_request(method, headers, body, target)?;
@@ -525,6 +566,106 @@ mod timeout_tests {
         }
     }
 }
+
+#[cfg(all(
+    test,
+    feature = "unstable_linked_resource_integrity",
+    not(target_arch = "wasm32")
+))]
+mod https_redirect_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::{
+        io::Cursor,
+        sync::{Arc, Mutex},
+    };
+
+    use super::*;
+
+    /// Redirects `https://example.com/start` to `location` and answers any other URL with 200,
+    /// recording each requested URL.
+    #[derive(Clone, Default)]
+    struct RedirectOnce {
+        location: &'static str,
+        requested: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SyncHttpResolver for RedirectOnce {
+        fn http_resolve(
+            &self,
+            request: Request<Vec<u8>>,
+        ) -> Result<Response<Box<dyn Read>>, HttpResolverError> {
+            let uri = request.uri().to_string();
+            self.requested.lock().unwrap().push(uri.clone());
+            let response = if uri == "https://example.com/start" {
+                Response::builder()
+                    .status(302)
+                    .header(http::header::LOCATION, self.location)
+            } else {
+                Response::builder().status(200)
+            };
+            Ok(response
+                .body(Box::new(Cursor::new(Vec::<u8>::new())) as Box<dyn Read>)
+                .unwrap())
+        }
+    }
+
+    fn resolve(location: &'static str, https_only: bool) -> (bool, Vec<String>) {
+        let inner = RedirectOnce {
+            location,
+            ..Default::default()
+        };
+        let mut request = Request::get("https://example.com/start");
+        if https_only {
+            request = request.extension(HttpsRedirectsOnly);
+        }
+        let result = RedirectResolver::new(inner.clone(), true)
+            .http_resolve(request.body(Vec::new()).unwrap());
+        let requested = inner.requested.lock().unwrap().clone();
+        (result.is_ok(), requested)
+    }
+
+    #[test]
+    fn https_redirects_only_refuses_downgrades_and_userinfo() {
+        for location in [
+            "http://example.com/next",
+            "https://user@example.com/next",
+            "ftp://example.com/next",
+        ] {
+            assert_eq!(
+                resolve(location, true),
+                (false, vec!["https://example.com/start".to_owned()]),
+                "{location}"
+            );
+        }
+
+        assert_eq!(
+            resolve("/next", true),
+            (
+                true,
+                vec![
+                    "https://example.com/start".to_owned(),
+                    "https://example.com/next".to_owned()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn redirects_without_the_extension_are_unchanged() {
+        assert_eq!(
+            resolve("http://example.com/next", false),
+            (
+                true,
+                vec![
+                    "https://example.com/start".to_owned(),
+                    "http://example.com/next".to_owned()
+                ]
+            )
+        );
+    }
+}
+
 /// Returns the redirect target from a response's `Location` header if it is an HTTP redirect (a 3xx
 /// status carrying a `Location`), otherwise `None`. A 3xx without a `Location` (e.g.
 /// `304 Not Modified`) is not treated as a redirect.

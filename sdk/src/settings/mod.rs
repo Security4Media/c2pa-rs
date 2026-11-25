@@ -60,6 +60,22 @@ pub(crate) const DEFAULT_TIME_STAMP_REQUEST_TIMEOUT_IN_MS: u64 = 10_000;
 /// Default pause before the second time-stamp request attempt, in milliseconds.
 pub(crate) const DEFAULT_TIME_STAMP_RETRY_DELAY_IN_MS: u64 = 500;
 
+/// Default maximum number of linked resources retrieved per manifest.
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub(crate) const DEFAULT_MAX_LINKED_RESOURCES: u32 = 100;
+
+/// Default largest linked resource read, in bytes (256 MiB).
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub(crate) const DEFAULT_MAX_LINKED_RESOURCE_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Default time limit of one linked resource retrieval, in milliseconds.
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub(crate) const DEFAULT_LINKED_RESOURCE_TIMEOUT_IN_MS: u64 = 60_000;
+
+/// Default time limit of all the linked resource retrievals of one manifest, in milliseconds.
+#[cfg(feature = "unstable_linked_resource_integrity")]
+pub(crate) const DEFAULT_LINKED_RESOURCE_TOTAL_TIMEOUT_IN_MS: u64 = 300_000;
+
 thread_local!(
     static SETTINGS: RefCell<Value> = RefCell::new(
         serde_json::to_value(Settings::default()).unwrap_or(Value::Object(Map::new())),
@@ -720,6 +736,136 @@ pub struct Verify {
     /// This limit is enforced after the HTTP resolver returns. It does not bound
     /// buffering inside a resolver, including the built-in reqwest adapters.
     pub max_manifest_response_size: u64,
+    /// Whether the [`Reader`] retrieves the resources listed in the active manifest's
+    /// [linked resource integrity assertions] and checks them against their declared size,
+    /// media type and hash.
+    ///
+    /// The default value is false: every listed resource is then reported as
+    /// `assertion.linkedResourceIntegrity.skipped`. When true, each resource is reported as
+    /// `match`, `inaccessible`, `sizeMismatch`, `formatMismatch` or `hashMismatch` instead.
+    /// None of these outcomes changes the validation state.
+    ///
+    /// Retrieval follows the spec's rules for external data:
+    /// - It happens only once the active manifest validated, hard binding included. The
+    ///   resources of a manifest that the [`Reader`] reports as `Invalid` stay `skipped`, as do
+    ///   those of ingredient manifests.
+    /// - The signing credential must not be reported untrusted. The spec rejects a claim whose
+    ///   credential is untrusted, which is every claim when `verify.verify_trust` is true (the
+    ///   default) and no trust list is configured, so its resources stay `skipped` even though
+    ///   the validation state is `Valid`: the SDK tolerates `signingCredential.untrusted` in
+    ///   the state. Configure a trust list to retrieve them. With `verify.verify_trust` false
+    ///   the credential is not checked, so retrieval goes ahead without that check.
+    /// - Only `https` URLs are retrieved, and a URL with a userinfo part (`user@host`) is
+    ///   refused. Requests go through the [`Context`] HTTP resolver, so
+    ///   [`Core::allowed_network_hosts`] and [`Core::allow_redirects`] apply, and the built-in
+    ///   resolver follows a redirect only to an `https` URL without a userinfo part. In a
+    ///   browser, `fetch` follows redirects itself, so that per-redirect rule does not apply
+    ///   there. A custom resolver must apply its own policy.
+    /// - The URLs come from the manifest, not from the application. Under the default policy
+    ///   a URL that directly names a loopback or private host is still retrieved, so set
+    ///   [`Core::allowed_network_hosts`] to limit retrieval to the hosts you expect.
+    /// - Each response must be `200 OK` without content coding: the SDK asks for `identity`
+    ///   and does not decode `gzip` or other codings. A custom resolver that decodes must
+    ///   remove the `Content-Encoding` header.
+    /// - The media type compared with `dc:format` is the `Content-Type` of the response, or
+    ///   `application/octet-stream` without one. Type and subtype are compared without regard
+    ///   to case, and parameters such as `charset` are ignored.
+    /// - Retrieval is bounded by [`max_linked_resources`](Self::max_linked_resources),
+    ///   [`max_linked_resource_size`](Self::max_linked_resource_size),
+    ///   [`linked_resource_timeout_in_ms`](Self::linked_resource_timeout_in_ms) and
+    ///   [`linked_resource_total_timeout_in_ms`](Self::linked_resource_total_timeout_in_ms).
+    ///   Resources not attempted within these limits stay `skipped`.
+    ///
+    /// Relative resources resolve against the base set with
+    /// [`Reader::with_linked_resource_base`]. Without one they are not retrieved and stay
+    /// `skipped`, with an explanation saying that no base is set. The SDK does not derive a
+    /// base from the asset, not even when reading a file.
+    ///
+    /// <div class="warning">
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    ///
+    /// </div>
+    ///
+    /// [`Reader`]: crate::Reader
+    /// [`Reader::with_linked_resource_base`]: crate::Reader::with_linked_resource_base
+    /// [`Context`]: crate::Context
+    /// [linked resource integrity assertions]: crate::assertions::LinkedResourceIntegrity
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub fetch_linked_resources: bool,
+    /// Maximum number of linked resources the [`Reader`] retrieves per manifest when
+    /// [`fetch_linked_resources`](Self::fetch_linked_resources) is true. Resources past it
+    /// stay `assertion.linkedResourceIntegrity.skipped`, so that one manifest cannot make the
+    /// validator issue an unbounded number of requests.
+    ///
+    /// The default value is 100. The value must be at least 1; set
+    /// [`fetch_linked_resources`](Self::fetch_linked_resources) to false to retrieve none.
+    ///
+    /// <div class="warning">
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    ///
+    /// </div>
+    ///
+    /// [`Reader`]: crate::Reader
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub max_linked_resources: u32,
+    /// Largest linked resource the [`Reader`] reads, in bytes, when
+    /// [`fetch_linked_resources`](Self::fetch_linked_resources) is true.
+    ///
+    /// The SDK reads at most the declared `size` of a resource, or this limit when it has
+    /// none. A resource that declares a larger `size` is reported as
+    /// `assertion.linkedResourceIntegrity.inaccessible` without a request, and so is one
+    /// without a declared size that turns out larger. The body is hashed as it is read, not
+    /// kept in memory. Like [`max_manifest_response_size`](Self::max_manifest_response_size),
+    /// this limit applies after the HTTP resolver returns: it does not bound buffering inside
+    /// a resolver, and the built-in `reqwest` adapters read the whole body before returning.
+    ///
+    /// The default is 256 MiB (268,435,456 bytes). The value must be at least 1.
+    ///
+    /// <div class="warning">
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    ///
+    /// </div>
+    ///
+    /// [`Reader`]: crate::Reader
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub max_linked_resource_size: u64,
+    /// Time limit of one linked resource retrieval, in milliseconds, redirects and body
+    /// included. A retrieval that runs out of time is reported as
+    /// `assertion.linkedResourceIntegrity.inaccessible`.
+    ///
+    /// The built-in `ureq` and native `reqwest` resolvers apply it. On WASI and in a browser,
+    /// a single retrieval is bounded only by the platform, and a custom resolver must apply
+    /// it itself.
+    ///
+    /// The default is 60,000 (60 seconds). The value must be at least 1.
+    ///
+    /// <div class="warning">
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    ///
+    /// </div>
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub linked_resource_timeout_in_ms: u64,
+    /// Time limit of all the linked resource retrievals of one manifest, in milliseconds.
+    ///
+    /// Retrievals run one after another, so without this limit a manifest listing many slow
+    /// resources could hold a read for [`max_linked_resources`](Self::max_linked_resources)
+    /// times [`linked_resource_timeout_in_ms`](Self::linked_resource_timeout_in_ms). The last
+    /// retrieval gets only the time that is left, and resources not attempted in time stay
+    /// `assertion.linkedResourceIntegrity.skipped`.
+    ///
+    /// The default is 300,000 (5 minutes). The value must be at least 1.
+    ///
+    /// <div class="warning">
+    ///
+    /// **Experimental.** Requires the `unstable_linked_resource_integrity` feature.
+    ///
+    /// </div>
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    pub linked_resource_total_timeout_in_ms: u64,
     /// Whether to skip ingredient conflict resolution when multiple ingredients have the same
     /// manifest identifier. This settings is only applicable for C2PA v2 validation.
     ///
@@ -746,6 +892,16 @@ impl Default for Verify {
             ocsp_fetch_should_override: false,
             remote_manifest_fetch: true,
             max_manifest_response_size: DEFAULT_MAX_MANIFEST_RESPONSE_SIZE,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            fetch_linked_resources: false,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            max_linked_resources: DEFAULT_MAX_LINKED_RESOURCES,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            max_linked_resource_size: DEFAULT_MAX_LINKED_RESOURCE_SIZE,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            linked_resource_timeout_in_ms: DEFAULT_LINKED_RESOURCE_TIMEOUT_IN_MS,
+            #[cfg(feature = "unstable_linked_resource_integrity")]
+            linked_resource_total_timeout_in_ms: DEFAULT_LINKED_RESOURCE_TOTAL_TIMEOUT_IN_MS,
             skip_ingredient_conflict_resolution: false,
             strict_v1_validation: false,
         }
@@ -761,6 +917,23 @@ impl SettingsValidate for Verify {
                 "max_manifest_response_size must be between 1 and {} bytes",
                 isize::MAX
             )));
+        }
+        #[cfg(feature = "unstable_linked_resource_integrity")]
+        for (name, value) in [
+            ("max_linked_resources", u64::from(self.max_linked_resources)),
+            ("max_linked_resource_size", self.max_linked_resource_size),
+            (
+                "linked_resource_timeout_in_ms",
+                self.linked_resource_timeout_in_ms,
+            ),
+            (
+                "linked_resource_total_timeout_in_ms",
+                self.linked_resource_total_timeout_in_ms,
+            ),
+        ] {
+            if value == 0 {
+                return Err(Error::BadParam(format!("{name} must be at least 1")));
+            }
         }
         Ok(())
     }
@@ -1534,6 +1707,79 @@ pub mod tests {
                     .max_manifest_response_size,
                 20971520
             );
+        }
+    }
+
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    #[test]
+    fn test_fetch_linked_resources_configuration() {
+        assert!(!Settings::default().verify.fetch_linked_resources);
+
+        for context in [
+            crate::Context::new()
+                .with_settings(r#"{"verify":{"fetch_linked_resources":true}}"#)
+                .unwrap(),
+            crate::Context::new()
+                .with_settings("[verify]\nfetch_linked_resources = true")
+                .unwrap(),
+            crate::Context::new()
+                .with_settings_value("verify.fetch_linked_resources", true)
+                .unwrap(),
+        ] {
+            assert!(context.settings().verify.fetch_linked_resources);
+            let json = serde_json::to_string(context.settings()).unwrap();
+            assert!(
+                Settings::new()
+                    .with_json(&json)
+                    .unwrap()
+                    .verify
+                    .fetch_linked_resources
+            );
+        }
+    }
+
+    #[cfg(feature = "unstable_linked_resource_integrity")]
+    #[test]
+    fn test_linked_resource_limits_configuration() {
+        let verify = Settings::default().verify;
+        assert_eq!(
+            (
+                verify.max_linked_resources,
+                verify.max_linked_resource_size,
+                verify.linked_resource_timeout_in_ms,
+                verify.linked_resource_total_timeout_in_ms
+            ),
+            (100, 256 * 1024 * 1024, 60_000, 300_000)
+        );
+
+        let settings = Settings::new()
+            .with_toml(
+                "[verify]\nmax_linked_resources = 10\nmax_linked_resource_size = 1024\n\
+                 linked_resource_timeout_in_ms = 2000\nlinked_resource_total_timeout_in_ms = 5000",
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                settings.verify.max_linked_resources,
+                settings.verify.max_linked_resource_size,
+                settings.verify.linked_resource_timeout_in_ms,
+                settings.verify.linked_resource_total_timeout_in_ms
+            ),
+            (10, 1024, 2000, 5000)
+        );
+
+        for key in [
+            "verify.max_linked_resources",
+            "verify.max_linked_resource_size",
+            "verify.linked_resource_timeout_in_ms",
+            "verify.linked_resource_total_timeout_in_ms",
+        ] {
+            let result = Settings::new().with_value(key, 0u64);
+            assert!(
+                matches!(result, Err(Error::BadParam(ref msg)) if msg.contains(&key[7..])),
+                "expected an invalid {key} error, got {result:?}"
+            );
+            assert!(Settings::new().with_value(key, -1).is_err(), "{key}");
         }
     }
 
